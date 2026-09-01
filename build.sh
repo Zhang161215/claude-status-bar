@@ -19,9 +19,17 @@ echo "Compiling universal binary (arm64 + x86_64)…"
 # compiles joined by lipo. Keep the deployment target pinned, else swiftc stamps the binary
 # with the build machine's OS and it refuses to launch on older systems despite LSMinimumSystemVersion.
 swiftc -O -target arm64-apple-macos12.0  Sources/*.swift -o "$BIN.arm64"  -framework Cocoa
-swiftc -O -target x86_64-apple-macos12.0 Sources/*.swift -o "$BIN.x86_64" -framework Cocoa
-lipo -create "$BIN.arm64" "$BIN.x86_64" -output "$BIN"
-rm -f "$BIN.arm64" "$BIN.x86_64"
+# 只装了 CommandLineTools（没有完整 Xcode）时，Swift 兼容库没有 x86_64 slice，Intel 那条会链接失败。
+# 自建自用的场景下没必要为此装 15GB 的 Xcode——降级成只出本机架构，照常出包。
+if swiftc -O -target x86_64-apple-macos12.0 Sources/*.swift -o "$BIN.x86_64" -framework Cocoa 2>/dev/null; then
+    lipo -create "$BIN.arm64" "$BIN.x86_64" -output "$BIN"
+    rm -f "$BIN.arm64" "$BIN.x86_64"
+    echo "已生成通用二进制 (arm64 + x86_64)"
+else
+    echo "⚠️  x86_64 slice 编译失败（CommandLineTools 缺 Swift 兼容库的 Intel 版），改为仅 arm64"
+    mv "$BIN.arm64" "$BIN"
+    rm -f "$BIN.x86_64"
+fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

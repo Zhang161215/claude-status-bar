@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Maps a Claude Code hook event to this session's file: ~/.claude/statusbar/state.d/<session_id>.json
-// Usage: node update.js <prompt|pre|post|notify|permreq|stop>
+// Usage: node update.js <prompt|pre|post|notify|permreq|stop|fail>
 
 const fs = require("fs");
 const os = require("os");
@@ -15,10 +15,10 @@ const quitMarker = path.join(dir, "quit-intent");
 const event = process.argv[2] || "";
 
 const TOOL_LABELS = {
-  Bash: "Running command", Edit: "Editing", Write: "Writing", MultiEdit: "Editing",
-  NotebookEdit: "Editing", Read: "Reading", Grep: "Searching", Glob: "Searching",
-  WebFetch: "Browsing web", WebSearch: "Searching web", Task: "Delegating",
-  TodoWrite: "Planning",
+  Bash: "执行命令", Edit: "编辑文件", Write: "写入文件", MultiEdit: "编辑文件",
+  NotebookEdit: "编辑文件", Read: "读取文件", Grep: "搜索中", Glob: "搜索中",
+  WebFetch: "浏览网页", WebSearch: "联网搜索", Task: "分派任务",
+  TodoWrite: "规划中",
 };
 
 const safeId = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "unknown";
@@ -55,15 +55,15 @@ process.stdin.on("end", () => {
 
   switch (event) {
     case "prompt":
-      state = "thinking"; label = "Thinking…"; startedAt = ts; break;
+      state = "thinking"; label = "思考中…"; startedAt = ts; break;
     case "pre": {
       const t = p.tool_name || "";
-      state = "tool"; label = TOOL_LABELS[t] || "Using tool";
+      state = "tool"; label = TOOL_LABELS[t] || "调用工具";
       if (!startedAt) startedAt = ts;
       break;
     }
     case "post":
-      state = "thinking"; label = "Thinking…";
+      state = "thinking"; label = "思考中…";
       if (!startedAt) startedAt = ts;
       break;
     case "notify": {
@@ -74,14 +74,29 @@ process.stdin.on("end", () => {
       const isPerm = p.notification_type === "permission_prompt" ||
         m.includes("permission") || m.includes("approve") || m.includes("allow");
       if (!isPerm) return;
-      state = "permission"; label = "Awaiting permission"; startedAt = 0;
+      // 保留本轮起点而不是抹成 0：applyTitle 的条件是 startedAt > 0，置 0 会让计时器在整个
+      // 等待授权期间消失——而授权确认恰恰是最想知道"卡了多久"的时候。
+      state = "permission"; label = "等待授权";
+      if (!startedAt) startedAt = ts;
       break;
     }
     case "permreq":
       // Desktop-app permission signal; not redundant with notify (that's CLI-only).
-      state = "permission"; label = "Awaiting permission"; startedAt = 0; break;
+      state = "permission"; label = "等待授权";
+      if (!startedAt) startedAt = ts;
+      break;
     case "stop":
-      state = "done"; label = "Done"; startedAt = 0; break;
+      state = "done"; label = "完成"; startedAt = 0; break;
+    case "fail": {
+      // 两个来源共用：StopFailure（API 层错误，rate_limit/overloaded/server_error…，无 tool_name）
+      // 和 PostToolUseFailure（工具调用失败，带 tool_name）。后者能指出是哪一步崩的，信息量更大。
+      const t = p.tool_name || "";
+      const what = TOOL_LABELS[t] || t;
+      state = "error";
+      label = what ? `${what}失败 (×_×)` : "出错了 (×_×)";
+      startedAt = 0;
+      break;
+    }
     default:
       return;
   }

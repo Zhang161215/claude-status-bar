@@ -1,0 +1,64 @@
+name: 构建
+
+on:
+  push:
+    branches: [zh-cn, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # 打 tag 时要建 Release
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: 编译
+        # runner 装了完整 Xcode，所以这里能出 arm64 + x86_64 通用二进制；
+        # 只有 Command Line Tools 的机器会自动降级成本机架构（见 build.sh 注释）。
+        run: ./build.sh
+
+      - name: 校验产物
+        run: |
+          APP="build/Claude Status Bar.app"
+          test -d "$APP" || { echo "::error::未生成 .app"; exit 1; }
+          echo "架构: $(lipo -archs "$APP/Contents/MacOS/ClaudeStatusBar")"
+          codesign -dv "$APP" 2>&1 | grep -E "Signature|Identifier" || true
+          # hooks 脚本必须打进 Resources，否则首次启动无法自装
+          for f in update.js lifecycle.js install.js uninstall.js; do
+            test -f "$APP/Contents/Resources/$f" || { echo "::error::缺少 $f"; exit 1; }
+          done
+          echo "产物校验通过"
+
+      - name: 打包
+        # 用 ditto 而不是 zip：它能正确保留 .app 的符号链接和扩展属性
+        run: |
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent "Claude Status Bar.app" ClaudeStatusBar-zh.zip
+          echo "大小: $(du -h ClaudeStatusBar-zh.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeStatusBar-zh
+          path: build/ClaudeStatusBar-zh.zip
+          retention-days: 30
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" build/ClaudeStatusBar-zh.zip \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes "> 本构建为 **ad-hoc 签名**（无 Apple Developer ID），首次打开会被 Gatekeeper 拦截。
+            > 右键点图标 → 打开 → 再点「打开」，或执行：
+            > \`xattr -dr com.apple.quarantine \"/Applications/Claude Status Bar.app\"\`"

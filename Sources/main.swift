@@ -272,7 +272,7 @@ final class CopyRowView: NSView {
         label.setFrameOrigin(NSPoint(x: pad, y: (rowH - label.frame.height) / 2))
         label.autoresizingMask = [.maxXMargin]
         addSubview(label)
-        icon.image = NSImage(systemSymbolName: "square.on.square", accessibilityDescription: "Copy")
+        icon.image = NSImage(systemSymbolName: "square.on.square", accessibilityDescription: "复制")
         icon.contentTintColor = .secondaryLabelColor
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.frame = NSRect(x: width - pad - iconSize, y: (rowH - iconSize) / 2, width: iconSize, height: iconSize)
@@ -303,7 +303,7 @@ final class CopyRowView: NSView {
         pb.clearContents()
         pb.setString(command, forType: .string)
         copied = true
-        icon.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Copied")
+        icon.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "已复制")
         icon.contentTintColor = .white  // click happens mid-hover; setHover keeps it labelColor otherwise
         // Give the checkmark a beat to register before the menu closes.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
@@ -313,7 +313,14 @@ final class CopyRowView: NSView {
 }
 
 final class StatusController: NSObject, NSMenuDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    // autosaveName 是 macOS 持久化状态项位置的唯一途径：没有它，系统就没有 key 去存这个图标
+    // 拖到哪了，Cmd+拖拽的结果活不过一次重启，每次启动都被塞回系统分配的默认位置（紧邻系统区）。
+    // 有了它，位置会写进本 App 的 "NSStatusItem Preferred Position ClaudeStatusBar"。
+    let statusItem: NSStatusItem = {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.autosaveName = "ClaudeStatusBar"
+        return item
+    }()
     let stateDir = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/statusbar/state.d")
     let claudeDesktopBundleID = "com.anthropic.claudefordesktop"
 
@@ -368,6 +375,12 @@ final class StatusController: NSObject, NSMenuDelegate {
     var startedAt: Double = 0  // unix seconds the current turn began (0 = no clock)
     var activeColor: NSColor? = nil
     var lastTitleText: String? = nil
+    var lastTitleColor: NSColor? = nil  // 与 lastTitleText 一起构成 applyTitle 的重绘缓存键
+    // 文字底下的垫片。菜单栏透明，彩色文字直接压在壁纸上会糊，垫一层半透明底能稳住对比度。
+    // 用 button.layer 而不是 NSVisualEffectView：状态栏按钮的图标和文字是它自己 draw 的，任何子视图
+    // 都会盖在上面（真磨砂因此做不了）；layer 位于自绘内容之下，且天然铺满整个按钮，图标一起罩住。
+    var backdropAlpha: Double = 0.22   // 0 = 关闭
+    var backdropRadius: Double = 5
     // Tinted frames are deterministic per (style, frame, color); rebuilding one per animation
     // step re-rasterized identical images at fps. Cleared when the style or color changes.
     var iconCache: [String: NSImage] = [:]
@@ -376,6 +389,10 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     let brand = NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1) // #d97757, Anthropic's official "Orange" accent
     let amber = NSColor(srgbRed: 0.95, green: 0.73, blue: 0.18, alpha: 1) // "awaiting permission" yellow dot
+    let green = NSColor(srgbRed: 0.298, green: 0.686, blue: 0.314, alpha: 1) // #4caf50，"已完成"绿灯
+    let red = NSColor(srgbRed: 0.898, green: 0.224, blue: 0.208, alpha: 1)   // #e53935，"出错"红灯
+    // 完成后绿灯停留多久再退回静默图标。别设太长：菜单栏是公共空间，任务都跑完了不该一直占着。
+    let doneFlashWindow: TimeInterval = 5
     let frames: [NSImage] = StatusController.loadFrames()
     let spriteFPS: Double = 9 // tune: 8 frames per loop -> ~0.9s/cycle
 
@@ -383,7 +400,10 @@ final class StatusController: NSObject, NSMenuDelegate {
     var animStyle: AnimStyle = .web
     var showTimer = false
     var iconSystem = false // false = brand Orange; true = adaptive black/white (template image)
-    var useThinkingWords = true     // rotate a playful verb ("Manifesting…") in place of "Thinking…"
+    // 思考词风格。cute=中文+颜文字，plain=纯中文，english=上游英文原版，off=固定"思考中…"。
+    // 取代了早期的布尔开关 "thinkingWords"，旧值在 loadSettings 里迁移。
+    enum WordStyle: String { case cute, plain, english, off }
+    var wordStyle: WordStyle = .cute
     var sessionWord: [String: String] = [:] // id -> current thinking word; re-picked on each entry into "thinking"
     var soundThreshold: Double = 0  // 0 = off; else the min turn length (seconds) that chimes on completion
     var turnStart: [String: Double] = [:]  // id -> active turn start, for the completion-sound length gate
@@ -393,9 +413,22 @@ final class StatusController: NSObject, NSMenuDelegate {
         s.volume = 0.7 // the clip is loud at full system volume; play it a bit softer
         return s
     }()
-    // Claude Code's SPINNER_VERBS, minus the hyphenated/tongue-twister ones. Longest kept is ~14 chars
-    // ("Hullaballooing"/"Metamorphosing"); with the timer showing they can get wide in a crowded menu bar.
-    let thinkingWords = [
+    // 一份数据喂两种中文风格：plain 只取词，cute 再拼上颜文字。避免维护两份词表走样。
+    // 颜文字逐字验过系统字体回退链，无缺字形；拼接后最宽一条约 120pt，与原版最长的
+    // "Metamorphosing…"（116pt）基本持平，拥挤的菜单栏里不会被挤掉。
+    let wordPairs: [(String, String)] = [
+        ("思考中", "(・ω・)"), ("琢磨中", "(´･ω･`)"), ("推敲中", "(｀･ω･´)"), ("冥想中", "(－ω－)"),
+        ("沉思中", "(・_・)"), ("发呆中", "(◎_◎)"), ("走神中", "(｡･ω･｡)"), ("酝酿中", "✧"),
+        ("构思中", "☆"), ("孵化中", "(´• ω •`)"), ("发酵中", "～"), ("炖着呢", "♨"),
+        ("搬砖中", "(>_<)"), ("码字中", "✍"), ("敲代码", "(・´ω`・)"), ("狂输出", "✦"),
+        ("苦干中", "(>﹏<)"), ("加速中", "♪"), ("摸鱼中", "(￣▽￣)"), ("划水中", "～"),
+        ("装忙中", "(・∀・)"), ("打盹中", "(－_－)"), ("神游中", "(￣ω￣)"), ("施法中", "✧"),
+        ("炼丹中", "♨"), ("召唤中", "★"), ("占卜中", "☆"), ("通灵中", "(⊙_⊙)"),
+        ("挠头中", "(・・?)"), ("打转中", "(@_@)"), ("冒烟中", "(×_×)"), ("卡壳中", "(・・;)"),
+        ("蒙圈中", "(⊙﹏⊙)"), ("灵光闪", "✦"), ("开窍了", "(☆▽☆)"), ("顿悟中", "(・∀・)"),
+        ("有谱了", "(｀・ω・´)"), ("捣鼓中", "(・ω・)ノ"), ("鼓捣中", "♪"), ("折腾中", "(￣ー￣)")]
+    // Claude Code 的 SPINNER_VERBS，去掉带连字符/绕口的那些。上游原版，english 风格用。
+    let englishWords = [
         "Accomplishing", "Actioning", "Actualizing", "Architecting", "Baking", "Beaming", "Beboppin'",
         "Befuddling", "Billowing", "Blanching", "Bloviating", "Boogieing", "Boondoggling", "Booping",
         "Bootstrapping", "Brewing", "Bunning", "Burrowing", "Calculating", "Canoodling", "Caramelizing",
@@ -420,6 +453,15 @@ final class StatusController: NSObject, NSMenuDelegate {
         "Thinking", "Thundering", "Tinkering", "Tomfoolering", "Transfiguring", "Transmuting", "Twisting",
         "Undulating", "Unfurling", "Unravelling", "Vibing", "Waddling", "Wandering", "Warping",
         "Whirlpooling", "Whirring", "Whisking", "Wibbling", "Working", "Wrangling", "Zesting", "Zigzagging"]
+    // 当前风格的词库。省略号统一在这里补齐，workingLabel 拿到的就是成品。off 返回空表示不轮换。
+    var thinkingWords: [String] {
+        switch wordStyle {
+        case .cute:    return wordPairs.map { "\($0.0)… \($0.1)" }
+        case .plain:   return wordPairs.map { "\($0.0)…" }
+        case .english: return englishWords.map { $0 + "…" }
+        case .off:     return []
+        }
+    }
     var iconColor: NSColor? { iconSystem ? nil : brand } // nil => render as an adaptive template
     let codeGlyphs = ["✻", "✽", "✶", "✳", "✢"]
     let codePeaks: [CGFloat] = [1.0, 1.0, 1.0, 1.0, 1.0]
@@ -451,8 +493,12 @@ final class StatusController: NSObject, NSMenuDelegate {
         super.init()
         let d = UserDefaults.standard
         if d.object(forKey: "showTimer") != nil { showTimer = d.bool(forKey: "showTimer") }
+        if d.object(forKey: "backdropAlpha") != nil { backdropAlpha = d.double(forKey: "backdropAlpha") }
+        if d.object(forKey: "backdropRadius") != nil { backdropRadius = d.double(forKey: "backdropRadius") }
         if d.object(forKey: "iconSystem") != nil { iconSystem = d.bool(forKey: "iconSystem") }
-        if d.object(forKey: "thinkingWords") != nil { useThinkingWords = d.bool(forKey: "thinkingWords") }
+        // 新键优先；没有新键时从旧的布尔开关迁移，老用户升级上来不会突然变样
+        if let s = d.string(forKey: "wordStyle"), let st = WordStyle(rawValue: s) { wordStyle = st }
+        else if d.object(forKey: "thinkingWords") != nil { wordStyle = d.bool(forKey: "thinkingWords") ? .cute : .off }
         if d.object(forKey: "soundThreshold") != nil { soundThreshold = d.double(forKey: "soundThreshold") }
         if let s = d.string(forKey: "animStyle"), let st = AnimStyle(rawValue: s) { animStyle = st }
         let menu = NSMenu()
@@ -658,7 +704,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         if visible.isEmpty, let lead = ordered.first { visible = [lead] }   // floor: never empty while alive
 
         if !visible.isEmpty {
-            menu.addItem(header("Sessions"))
+            menu.addItem(header("会话"))
             for s in visible {
                 let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
                 let view = SessionRowView(id: s.id, width: CGFloat(uiConfig()["boxWidth"] ?? 300))
@@ -673,28 +719,35 @@ final class StatusController: NSObject, NSMenuDelegate {
             menu.addItem(.separator())
         } else if desktopRunning {
             // No live session to pin, but the desktop app is up — give a way to jump back in.
-            menu.addItem(header("Sessions"))
-            let open = NSMenuItem(title: "Open Claude", action: #selector(openClaude), keyEquivalent: "")
+            menu.addItem(header("会话"))
+            let open = NSMenuItem(title: "打开 Claude", action: #selector(openClaude), keyEquivalent: "")
             open.target = self
             menu.addItem(open)
             menu.addItem(.separator())
         }
 
-        menu.addItem(header("Options"))
-        menu.addItem(toggleRow(title: "Show timer", isOn: showTimer) { [weak self] on in
+        menu.addItem(header("选项"))
+        menu.addItem(toggleRow(title: "显示计时器", isOn: showTimer) { [weak self] on in
             self?.showTimer = on
             UserDefaults.standard.set(on, forKey: "showTimer")
             self?.applyTitle()
         })
-        menu.addItem(toggleRow(title: "Thinking words", isOn: useThinkingWords) { [weak self] on in
-            self?.useThinkingWords = on
-            UserDefaults.standard.set(on, forKey: "thinkingWords")
-            self?.evaluate()   // re-render the bar label immediately with/without the rotating word
-        })
+        let wordParent = NSMenuItem(title: "思考词", action: nil, keyEquivalent: "")
+        let wordSub = NSMenu()
+        for (style, name) in [(WordStyle.cute, "可爱（带颜文字）"), (WordStyle.plain, "简洁"),
+                              (WordStyle.english, "英文原版"), (WordStyle.off, "关闭")] {
+            let it = NSMenuItem(title: name, action: #selector(chooseWordStyle(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = style.rawValue
+            it.state = wordStyle == style ? .on : .off
+            wordSub.addItem(it)
+        }
+        wordParent.submenu = wordSub
+        menu.addItem(wordParent)
 
-        let animParent = NSMenuItem(title: "Animation", action: nil, keyEquivalent: "")
+        let animParent = NSMenuItem(title: "动画", action: nil, keyEquivalent: "")
         let animSub = NSMenu()
-        for (style, name) in [(AnimStyle.web, "Claude Spark"), (AnimStyle.code, "Claude Code"), (AnimStyle.crab, "Crab Walking")] {
+        for (style, name) in [(AnimStyle.web, "Claude Spark"), (AnimStyle.code, "Claude Code"), (AnimStyle.crab, "螃蟹漫步")] {
             let it = NSMenuItem(title: name, action: #selector(chooseStyle(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = style.rawValue
@@ -704,9 +757,9 @@ final class StatusController: NSObject, NSMenuDelegate {
         animParent.submenu = animSub
         menu.addItem(animParent)
 
-        let colorParent = NSMenuItem(title: "Color", action: nil, keyEquivalent: "")
+        let colorParent = NSMenuItem(title: "颜色", action: nil, keyEquivalent: "")
         let colorSub = NSMenu()
-        for (sys, name) in [(false, "Orange"), (true, "System")] {
+        for (sys, name) in [(false, "橙色"), (true, "跟随系统")] {
             let it = NSMenuItem(title: name, action: #selector(chooseColor(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = sys
@@ -716,9 +769,32 @@ final class StatusController: NSObject, NSMenuDelegate {
         colorParent.submenu = colorSub
         menu.addItem(colorParent)
 
-        let soundParent = NSMenuItem(title: "Completion Sound", action: nil, keyEquivalent: "")
+        // 文字底色：不透明度和圆角合并成一个子菜单，用分组标题隔开，省得「选项」区再多两行。
+        let bdParent = NSMenuItem(title: "文字底色", action: nil, keyEquivalent: "")
+        let bdSub = NSMenu()
+        bdSub.addItem(header("不透明度"))
+        for (a, name) in [(0.0, "关闭"), (0.15, "淡"), (0.25, "中"), (0.40, "浓"), (0.55, "重")] {
+            let it = NSMenuItem(title: name, action: #selector(chooseBackdropAlpha(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = NSNumber(value: a)
+            it.state = abs(backdropAlpha - a) < 0.001 ? .on : .off
+            bdSub.addItem(it)
+        }
+        bdSub.addItem(.separator())
+        bdSub.addItem(header("圆角"))
+        for (r, name) in [(0.0, "直角"), (4.0, "小"), (8.0, "中"), (12.0, "药丸")] {
+            let it = NSMenuItem(title: name, action: #selector(chooseBackdropRadius(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = NSNumber(value: r)
+            it.state = abs(backdropRadius - r) < 0.001 ? .on : .off
+            bdSub.addItem(it)
+        }
+        bdParent.submenu = bdSub
+        menu.addItem(bdParent)
+
+        let soundParent = NSMenuItem(title: "完成提示音", action: nil, keyEquivalent: "")
         let soundSub = NSMenu()
-        for (secs, name) in [(0.0, "Off"), (0.1, "Every turn"), (60.0, "1 min+"), (300.0, "5 min+"), (900.0, "15 min+")] {
+        for (secs, name) in [(0.0, "关闭"), (0.1, "每轮都响"), (60.0, "超过 1 分钟"), (300.0, "超过 5 分钟"), (900.0, "超过 15 分钟")] {
             let it = NSMenuItem(title: name, action: #selector(chooseSound(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = NSNumber(value: secs)
@@ -729,7 +805,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         menu.addItem(soundParent)
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Version \(currentVersion)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "版本 \(currentVersion)（汉化版）", action: nil, keyEquivalent: ""))
         if let latest = UserDefaults.standard.string(forKey: "latestVersion"), versionIsNewer(latest, than: currentVersion) {
             let width = CGFloat(uiConfig()["boxWidth"] ?? 300)
             let brewVer = UserDefaults.standard.string(forKey: "brewCaskVersion")
@@ -737,21 +813,21 @@ final class StatusController: NSObject, NSMenuDelegate {
                 // Silent until the cask catches up (autobump lag): never offer a command that
                 // would report "already up to date".
                 if let bv = brewVer, versionIsNewer(bv, than: currentVersion) {
-                    let title = "Update to \(bv) via brew"
+                    let title = "通过 brew 更新到 \(bv)"
                     let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                     it.view = CopyRowView(title: title, command: brewUpgradeCommand, width: width)
                     menu.addItem(it)
                 }
             } else {
-                let up = NSMenuItem(title: "Update to \(latest)", action: #selector(openLatestRelease), keyEquivalent: "")
+                let up = NSMenuItem(title: "上游已发布 \(latest)", action: #selector(openLatestRelease), keyEquivalent: "")
                 up.target = self
                 menu.addItem(up)
-                let sw = NSMenuItem(title: "Switch to Homebrew", action: nil, keyEquivalent: "")
-                sw.view = CopyRowView(title: "Switch to Homebrew", command: brewInstallCommand, width: width)
+                let sw = NSMenuItem(title: "改用 Homebrew 管理", action: nil, keyEquivalent: "")
+                sw.view = CopyRowView(title: "改用 Homebrew 管理", command: brewInstallCommand, width: width)
                 menu.addItem(sw)
             }
         }
-        let q = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+        let q = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         q.target = self
         menu.addItem(q)
     }
@@ -852,9 +928,10 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func statusText(_ s: Session, eff: String) -> String {
         switch eff {
-        case "permission":       return "Awaiting permission"
+        case "error":            return s.label.isEmpty ? "出错了 (×_×)" : s.label
+        case "permission":       return "等待授权 (・・?)"
         case "thinking", "tool": return workingLabel(s)
-        default:                 return s.state == "done" ? "Done" : "Idle"
+        default:                 return s.state == "done" ? "已完成 (・∀・)" : "空闲 (－ω－)"
         }
     }
 
@@ -945,6 +1022,7 @@ final class StatusController: NSObject, NSMenuDelegate {
     // permission / thinking / tool / idle (done collapses to idle; waiting is never emitted).
     func priority(of eff: String) -> Int {
         switch eff {
+        case "error":            return 3   // 出错最高：多会话并行时，坏消息不该被别的会话压住
         case "permission":       return 2
         case "thinking", "tool": return 1
         default:                 return 0   // idle / unknown
@@ -952,9 +1030,10 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     func workingLabel(_ s: Session) -> String {
-        if useThinkingWords, s.state == "thinking", let w = sessionWord[s.id], !w.isEmpty { return w + "…" }
+        // 词库里已经带好省略号（"思考中… (・ω・)" / "Percolating…"），这里不再补，否则双省略号
+        if wordStyle != .off, s.state == "thinking", let w = sessionWord[s.id], !w.isEmpty { return w }
         if !s.label.isEmpty { return s.label }
-        return s.state == "tool" ? "Working…" : "Thinking…"
+        return s.state == "tool" ? "工作中…" : "思考中…"
     }
 
     // Re-pick a word each time a session ENTERS the thinking state (prompt, or a tool->thinking `post`),
@@ -963,8 +1042,10 @@ final class StatusController: NSObject, NSMenuDelegate {
     func updateThinkingWord(_ s: Session) {
         let prev = prevState[s.id] ?? ""
         guard s.state == "thinking", prev != "thinking" else { return }
-        var w = thinkingWords.randomElement() ?? "Thinking"
-        if thinkingWords.count > 1 { while w == sessionWord[s.id] { w = thinkingWords.randomElement() ?? w } }
+        let words = thinkingWords   // 计算属性，取一次存下来，别在下面的循环里反复 map
+        guard !words.isEmpty else { sessionWord[s.id] = nil; return }  // off 风格：不轮换，退回固定文案
+        var w = words.randomElement() ?? ""
+        if words.count > 1 { while w == sessionWord[s.id] { w = words.randomElement() ?? w } }
         sessionWord[s.id] = w
     }
 
@@ -1021,6 +1102,24 @@ final class StatusController: NSObject, NSMenuDelegate {
         evaluate() // re-render the current state in the new color
     }
 
+    // 两个选择器都得先清 lastTitleText：applyTitle 拿文字内容当重绘缓存键，底色变了但词没变时
+    // 会被缓存吃掉，点了菜单看不到变化。
+    @objc func chooseBackdropAlpha(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        backdropAlpha = n.doubleValue
+        UserDefaults.standard.set(backdropAlpha, forKey: "backdropAlpha")
+        lastTitleText = nil
+        evaluate()
+    }
+
+    @objc func chooseBackdropRadius(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        backdropRadius = n.doubleValue
+        UserDefaults.standard.set(backdropRadius, forKey: "backdropRadius")
+        lastTitleText = nil
+        evaluate()
+    }
+
     @objc func chooseSound(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
         soundThreshold = n.doubleValue
@@ -1034,6 +1133,17 @@ final class StatusController: NSObject, NSMenuDelegate {
         iconCache.removeAll()
         animTimer?.invalidate(); animTimer = nil // recreate at the new style's fps
         frameIdx = 0
+        evaluate()
+    }
+
+    @objc func chooseWordStyle(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let st = WordStyle(rawValue: raw) else { return }
+        wordStyle = st
+        UserDefaults.standard.set(raw, forKey: "wordStyle")
+        // 正在 thinking 的会话手里还攥着旧风格的词，而 updateThinkingWord 只在"进入"thinking 时换词，
+        // 不在这儿重挑的话，切完风格得等下一轮才见效。keys 先快照，避免遍历中改字典。
+        let words = thinkingWords
+        for id in Array(sessionWord.keys) { sessionWord[id] = words.randomElement() }  // words 为空时置 nil，退回固定文案
         evaluate()
     }
 
@@ -1197,12 +1307,24 @@ final class StatusController: NSObject, NSMenuDelegate {
 
         guard let lead = lead else { renderResting(); return }
         switch lead.eff {
+        case "error":
+            // 不设停留窗口（不同于 done 的 5 秒）：错误要一直亮到下一轮活动把它顶掉为止。
+            render(label: statusText(lead, eff: lead.eff), color: red, animate: false, startedAt: 0, dot: true)
         case "permission":
-            render(label: statusText(lead, eff: lead.eff), color: amber, animate: false, startedAt: 0, dot: true)
+            // 原本这里写死 startedAt: 0，等待授权期间计时器直接消失——而这正是最想知道"卡了多久"
+            // 的时刻。改传本轮起点；update.js 那侧也不再把 startedAt 抹成 0，两边配合才有钟。
+            render(label: statusText(lead, eff: lead.eff), color: amber, animate: false, startedAt: lead.startedAt, dot: true)
         case "thinking", "tool":
             render(label: statusText(lead, eff: lead.eff), color: iconColor, animate: true, startedAt: lead.startedAt)
         default:
-            renderResting()
+            // effectiveState 把 "done" 归一成了 "idle"，所以这里只能看原始 state。
+            // 刚跑完的几秒亮绿灯，之后退回静默：既看得见"结束了"，又不长期占菜单栏。
+            // tick() 每 0.4s 重跑 evaluate，窗口一过自然切走，不需要额外的定时器。
+            if lead.state == "done", Date().timeIntervalSince1970 - lead.ts < doneFlashWindow {
+                render(label: statusText(lead, eff: lead.eff), color: green, animate: false, startedAt: 0, dot: true)
+            } else {
+                renderResting()
+            }
         }
     }
 
@@ -1230,6 +1352,9 @@ final class StatusController: NSObject, NSMenuDelegate {
                last.contains("interrupted by user") { return "idle" }
             return s.state
         }
+        // 错误不设短时限：出了问题就该一直亮着等人看见，而不是自己悄悄消失。
+        // 但仍留一个 4 小时的兜底，防止 app 崩溃留下的残档永久卡住红灯。
+        if s.state == "error" { return now - s.ts > 14400 ? "idle" : "error" }
         return s.state == "done" ? "idle" : s.state
     }
 
@@ -1351,18 +1476,32 @@ final class StatusController: NSObject, NSMenuDelegate {
         // status item bitmap, so at animation fps an unchanged title costs a full redraw per frame
         // (the clock only ticks at 1 Hz). labelColor is dynamic and resolves at draw, so skipping
         // the assignment still tracks light/dark menu bars.
-        guard text != lastTitleText else { return }
+        // 颜色也得进缓存键：文字随状态变色后，会出现"词没变但颜色该变"的情况（在「颜色」菜单里
+        // 切换橙/跟随系统时最明显），只比字符串会把这次刷新吃掉。
+        let titleColor = activeColor ?? NSColor.labelColor
+        guard text != lastTitleText || titleColor != lastTitleColor else { return }
         lastTitleText = text
+        lastTitleColor = titleColor
         if text.isEmpty {
+            button.layer?.backgroundColor = nil   // 空闲态只剩图标，不给它套底
             button.imagePosition = .imageOnly
             button.attributedTitle = NSAttributedString(string: "")
             return
         }
         button.imagePosition = .imageLeading
-        // labelColor adapts: white on a dark menu bar, black on a light one. Monospaced
-        // digits keep the elapsed clock from nudging neighboring menu bar icons.
+        if backdropAlpha > 0 {
+            button.wantsLayer = true
+            button.layer?.backgroundColor = NSColor.black.withAlphaComponent(backdropAlpha).cgColor
+            button.layer?.cornerRadius = backdropRadius
+        } else {
+            button.layer?.backgroundColor = nil
+        }
+        // 文字跟当前状态色走：工作中橙、等待授权黄，不用盯图标就能分辨状态。
+        // activeColor 为 nil 表示用户在「颜色」里选了跟随系统，那文字也回到自适应 labelColor
+        // （深色菜单栏白字、浅色黑字），两者保持一致。
+        // 等宽数字仍然保留：否则秒数跳动会挤得旁边的菜单栏图标左右晃。
         let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.labelColor,
+            .foregroundColor: titleColor,
             .font: NSFont.monospacedDigitSystemFont(ofSize: 0, weight: .regular),
         ]
         button.attributedTitle = NSAttributedString(string: " \(text)", attributes: attrs)
