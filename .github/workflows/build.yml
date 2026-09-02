@@ -110,7 +110,7 @@ jobs:
           # platform.js 里检测进程用的是 claude-statusbar.exe，产物必须叫这个名字
           cp float/target/release/csb-float.exe dist/claude-statusbar.exe
           cp hooks/*.js dist/hooks/
-          cat > dist/使用说明.txt <<'TXT'
+          cat > dist/README-zh.txt <<'TXT'
           Claude Status Bar 汉化优化版 · Windows
 
           1. 把整个文件夹放到一个固定位置，例如

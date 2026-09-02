@@ -1,3 +1,7 @@
+// Windows 上不要控制台子系统，否则双击 exe 会额外弹一个黑窗口。
+// 只在 release 生效：debug 构建保留控制台，方便看 eprintln 的诊断输出。
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 // Claude Code 状态浮窗（跨平台）
 // 状态和外观都不自己定：状态读 ~/.claude/statusbar/state.d/*.json（hooks 写的），
 // 外观读同目录的 config.json（菜单栏 App 写的）。所以菜单栏改设置，这边跟着变。
