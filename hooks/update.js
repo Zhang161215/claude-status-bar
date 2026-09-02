@@ -72,6 +72,15 @@ function pickWord(prev) {
   return w;
 }
 
+
+// 等待授权时带上是哪个工具在等。Claude Code 没有"权限已批准"事件，所以从你点允许
+// 到工具跑完这段时间状态仍会停在 permission；带上工具名，至少能看出卡在哪一步。
+function permLabel(p, prev) {
+  const t = p.tool_name || prev.tool || "";
+  const what = TOOL_LABELS[t];
+  return what ? `等待授权 · ${what}` : "等待授权 (・・?)";
+}
+
 const safeId = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "unknown";
 
 let raw = "";
@@ -128,13 +137,13 @@ process.stdin.on("end", () => {
       if (!isPerm) return;
       // 保留本轮起点而不是抹成 0：applyTitle 的条件是 startedAt > 0，置 0 会让计时器在整个
       // 等待授权期间消失——而授权确认恰恰是最想知道"卡了多久"的时候。
-      state = "permission"; label = "等待授权 (・・?)";
+      state = "permission"; label = permLabel(p, prev);
       if (!startedAt) startedAt = ts;
       break;
     }
     case "permreq":
       // Desktop-app permission signal; not redundant with notify (that's CLI-only).
-      state = "permission"; label = "等待授权 (・・?)";
+      state = "permission"; label = permLabel(p, prev);
       if (!startedAt) startedAt = ts;
       break;
     case "stop":

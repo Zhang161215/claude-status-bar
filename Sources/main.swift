@@ -380,6 +380,9 @@ final class StatusController: NSObject, NSMenuDelegate {
     // 用 button.layer 而不是 NSVisualEffectView：状态栏按钮的图标和文字是它自己 draw 的，任何子视图
     // 都会盖在上面（真磨砂因此做不了）；layer 位于自绘内容之下，且天然铺满整个按钮，图标一起罩住。
     var floatWindow = false            // 独立的浮窗进程（Claude Float.app）
+    var floatIconSize: Double = 18     // 浮窗里动画图标的高度
+    var floatFps: Double = 0           // 浮窗动画帧率；0 = 跟随 GIF 自带延迟
+    var petId = "auto"                 // codex 宠物：auto=跟随 Codex 当前那只，none=不用，或具体 id
     var backdropAlpha: Double = 0.22   // 0 = 关闭
     var backdropRadius: Double = 5
     // Tinted frames are deterministic per (style, frame, color); rebuilding one per animation
@@ -397,7 +400,15 @@ final class StatusController: NSObject, NSMenuDelegate {
     let frames: [NSImage] = StatusController.loadFrames()
     let spriteFPS: Double = 9 // tune: 8 frames per loop -> ~0.9s/cycle
 
-    enum AnimStyle: String { case web, code, crab }
+    enum AnimStyle: String { case web, code, crab, pet }
+    // Codex 宠物雪碧图：整张只解码一次，按当前状态切出对应动作行。
+    // 规格来自 Codex 的 hatch-pet skill：8 列 x 9~11 行，单元格 192x208，
+    // 行序 0 idle / 1 running-right / 2 running-left / 3 waving / 4 jumping /
+    //      5 failed / 6 waiting / 7 running / 8 review（9-10 是朝向，用不上）。
+    var petSheet: NSImage?
+    var petSheetId = ""
+    var petRowFrames: [NSImage] = []
+    var petLoadedRow = -1
     var animStyle: AnimStyle = .web
     var showTimer = false
     var iconSystem = false // false = brand Orange; true = adaptive black/white (template image)
@@ -432,6 +443,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         case .web: return spriteFPS
         case .code: return Double(codeGlyphs.count * codeSub) / codeCycle
         case .crab: return crabFPS
+        case .pet: return 6   // 宠物动作行 4~8 帧，6fps 一轮约一秒，跟浮窗一致
         }
     }
     var frameCount: Int {
@@ -439,22 +451,16 @@ final class StatusController: NSObject, NSMenuDelegate {
         case .web: return max(1, frames.count)
         case .code: return codeGlyphs.count * codeSub
         case .crab: return max(1, crabFrames.count)
+        case .pet: return max(1, petRowFrames.count)
         }
     }
 
     override init() {
         super.init()
         let d = UserDefaults.standard
-        if d.object(forKey: "showTimer") != nil { showTimer = d.bool(forKey: "showTimer") }
-        if d.object(forKey: "floatWindow") != nil { floatWindow = d.bool(forKey: "floatWindow") }
-        if d.object(forKey: "backdropAlpha") != nil { backdropAlpha = d.double(forKey: "backdropAlpha") }
-        if d.object(forKey: "backdropRadius") != nil { backdropRadius = d.double(forKey: "backdropRadius") }
-        if d.object(forKey: "iconSystem") != nil { iconSystem = d.bool(forKey: "iconSystem") }
+        for setting in Self.sharedSettings { setting.load(self, d) }
         // 新键优先；没有新键时从旧的布尔开关迁移，老用户升级上来不会突然变样
-        if let s = d.string(forKey: "wordStyle"), let st = WordStyle(rawValue: s) { wordStyle = st }
-        else if d.object(forKey: "thinkingWords") != nil { wordStyle = d.bool(forKey: "thinkingWords") ? .cute : .off }
-        if d.object(forKey: "soundThreshold") != nil { soundThreshold = d.double(forKey: "soundThreshold") }
-        if let s = d.string(forKey: "animStyle"), let st = AnimStyle(rawValue: s) { animStyle = st }
+
         if floatWindow { launchFloatApp() }
         writeSharedConfig()  // 启动时同步一次，保证 update.js 拿到的是当前风格而不是默认值
         let menu = NSMenu()
@@ -687,6 +693,7 @@ final class StatusController: NSObject, NSMenuDelegate {
             self?.showTimer = on
             UserDefaults.standard.set(on, forKey: "showTimer")
             self?.applyTitle()
+            self?.writeSharedConfig()   // 浮窗也要跟着藏/显计时器
         })
         menu.addItem(toggleRow(title: "桌面浮窗", isOn: floatWindow) { [weak self] on in
             guard let self else { return }
@@ -695,6 +702,30 @@ final class StatusController: NSObject, NSMenuDelegate {
             self.writeSharedConfig()   // 关掉时浮窗读到 false 会自己退出
             if on { self.launchFloatApp() }
         })
+
+        // 浮窗外观：图标大小和播放速度合在一个子菜单里，用分组标题隔开
+        let flParent = NSMenuItem(title: "浮窗外观", action: nil, keyEquivalent: "")
+        let flSub = NSMenu()
+        flSub.addItem(header("图标大小"))
+        for (v, name) in [(18.0, "小"), (26.0, "中"), (34.0, "大"), (44.0, "特大")] {
+            let it = NSMenuItem(title: name, action: #selector(chooseFloatSize(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = NSNumber(value: v)
+            it.state = abs(floatIconSize - v) < 0.5 ? .on : .off
+            flSub.addItem(it)
+        }
+        flSub.addItem(.separator())
+        flSub.addItem(header("动画速度"))
+        // 16 帧的待机动画：4fps 一轮 4 秒偏悠闲，6fps 约 2.7 秒最自然，10fps 就开始显得毛躁
+        for (v, name) in [(0.0, "跟随 GIF"), (4.0, "慢"), (6.0, "正常"), (10.0, "快")] {
+            let it = NSMenuItem(title: name, action: #selector(chooseFloatFps(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = NSNumber(value: v)
+            it.state = abs(floatFps - v) < 0.1 ? .on : .off
+            flSub.addItem(it)
+        }
+        flParent.submenu = flSub
+        menu.addItem(flParent)
         let wordParent = NSMenuItem(title: "思考词", action: nil, keyEquivalent: "")
         let wordSub = NSMenu()
         for (style, name) in [(WordStyle.cute, "可爱（带颜文字）"), (WordStyle.plain, "简洁"),
@@ -710,12 +741,31 @@ final class StatusController: NSObject, NSMenuDelegate {
 
         let animParent = NSMenuItem(title: "动画", action: nil, keyEquivalent: "")
         let animSub = NSMenu()
+        animSub.addItem(header("内置"))
         for (style, name) in [(AnimStyle.web, "Claude Spark"), (AnimStyle.code, "Claude Code"), (AnimStyle.crab, "螃蟹漫步")] {
             let it = NSMenuItem(title: name, action: #selector(chooseStyle(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = style.rawValue
             it.state = animStyle == style ? .on : .off
             animSub.addItem(it)
+        }
+        // Codex 宠物跟内置动画并列：选中后菜单栏和浮窗一起换，不再各调各的
+        let pets = installedPets()
+        if !pets.isEmpty {
+            animSub.addItem(.separator())
+            animSub.addItem(header("Codex 宠物"))
+            let auto = NSMenuItem(title: "自动（跟随 Codex）", action: #selector(choosePet(_:)), keyEquivalent: "")
+            auto.target = self
+            auto.representedObject = "auto"
+            auto.state = (animStyle == .pet && petId == "auto") ? .on : .off
+            animSub.addItem(auto)
+            for (id, name) in pets {
+                let it = NSMenuItem(title: name, action: #selector(choosePet(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = id
+                it.state = (animStyle == .pet && petId == id) ? .on : .off
+                animSub.addItem(it)
+            }
         }
         animParent.submenu = animSub
         menu.addItem(animParent)
@@ -1058,6 +1108,59 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     // 两个选择器都得先清 lastTitleText：applyTitle 拿文字内容当重绘缓存键，底色变了但词没变时
     // 会被缓存吃掉，点了菜单看不到变化。
+
+    // codex-pets 装在 $CODEX_HOME/pets 或 ~/.codex/pets。素材不随本项目分发，
+    // 只读用户自己装好的那份，版权归各宠物作者（多为 CC BY-NC-SA，同人的更严）。
+    func codexPetsDir() -> String {
+        if let h = ProcessInfo.processInfo.environment["CODEX_HOME"], !h.isEmpty {
+            return (h as NSString).appendingPathComponent("pets")
+        }
+        return (NSHomeDirectory() as NSString).appendingPathComponent(".codex/pets")
+    }
+
+    // 返回 (目录名, 显示名)，只保留真的带雪碧图的目录
+    func installedPets() -> [(String, String)] {
+        let dir = codexPetsDir()
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+        return names.sorted().compactMap { id in
+            let base = (dir as NSString).appendingPathComponent(id)
+            guard fm.fileExists(atPath: (base as NSString).appendingPathComponent("spritesheet.webp")) else { return nil }
+            var display = id
+            let pj = (base as NSString).appendingPathComponent("pet.json")
+            if let d = fm.contents(atPath: pj),
+               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               let n = j["displayName"] as? String, !n.isEmpty { display = n }
+            return (id, display)
+        }
+    }
+
+    @objc func choosePet(_ sender: NSMenuItem) {
+        petId = (sender.representedObject as? String) ?? "auto"
+        animStyle = .pet          // 选宠物就等于把动画样式切到 pet，两端同时生效
+        petSheetId = ""           // 强制重新解码
+        petLoadedRow = -1
+        iconCache.removeAll()
+        UserDefaults.standard.set(petId, forKey: "petId")
+        UserDefaults.standard.set(animStyle.rawValue, forKey: "animStyle")
+        writeSharedConfig()
+        evaluate()
+    }
+
+    @objc func chooseFloatSize(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        floatIconSize = n.doubleValue
+        UserDefaults.standard.set(floatIconSize, forKey: "floatIconSize")
+        writeSharedConfig()
+    }
+
+    @objc func chooseFloatFps(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        floatFps = n.doubleValue
+        UserDefaults.standard.set(floatFps, forKey: "floatFps")
+        writeSharedConfig()
+    }
+
     // 浮窗是独立的 Claude Float.app（Rust 写的，跨平台，Windows 版会复用同一份代码）。
     // 这里只负责把它拉起来；关闭走 config.json，由它自己退出。
     func launchFloatApp() {
@@ -1116,16 +1219,66 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     // 与 hooks 和浮窗共享的配置。update.js 用 wordStyle 选词；浮窗读外观项，
     // 这样菜单栏改了设置，浮窗跟着一起变，不用各调各的。
+    // 所有用户可调设置集中定义在这里。加新设置只改这张表，UserDefaults 读取和
+    // config.json 写出都自动覆盖到。
+    // 之前这是两份手工列举的清单，靠人肉保持一致：加 showTimer 时漏了写出那一半，
+    // 结果浮窗读不到、一直用默认值，关了计时器它还在显示。
+    // jsonKey 为 nil 表示这项只在菜单栏用，不需要同步给浮窗。
+    struct SharedSetting {
+        let jsonKey: String?                                    // config.json 里的键名
+        let load: (StatusController, UserDefaults) -> Void      // 从 UserDefaults 恢复
+        let json: (StatusController) -> Any                     // 写给浮窗的值
+    }
+
+    static let sharedSettings: [SharedSetting] = [
+        .init(jsonKey: "showTimer",
+              load: { c, d in if d.object(forKey: "showTimer") != nil { c.showTimer = d.bool(forKey: "showTimer") } },
+              json: { $0.showTimer }),
+        .init(jsonKey: "floatWindow",
+              load: { c, d in if d.object(forKey: "floatWindow") != nil { c.floatWindow = d.bool(forKey: "floatWindow") } },
+              json: { $0.floatWindow }),
+        // UserDefaults 用 floatIconSize，浮窗那边叫 animHeight —— 键名历史遗留，
+        // 改名会丢用户已有配置，所以在这里显式映射。
+        .init(jsonKey: "animHeight",
+              load: { c, d in if d.object(forKey: "floatIconSize") != nil { c.floatIconSize = d.double(forKey: "floatIconSize") } },
+              json: { $0.floatIconSize }),
+        .init(jsonKey: "animFps",
+              load: { c, d in if d.object(forKey: "floatFps") != nil { c.floatFps = d.double(forKey: "floatFps") } },
+              json: { $0.floatFps }),
+        .init(jsonKey: "petId",
+              load: { c, d in c.petId = d.string(forKey: "petId") ?? "auto" },
+              json: { $0.petId }),
+        .init(jsonKey: "backdropAlpha",
+              load: { c, d in if d.object(forKey: "backdropAlpha") != nil { c.backdropAlpha = d.double(forKey: "backdropAlpha") } },
+              json: { $0.backdropAlpha }),
+        .init(jsonKey: "backdropRadius",
+              load: { c, d in if d.object(forKey: "backdropRadius") != nil { c.backdropRadius = d.double(forKey: "backdropRadius") } },
+              json: { $0.backdropRadius }),
+        .init(jsonKey: "iconSystem",
+              load: { c, d in if d.object(forKey: "iconSystem") != nil { c.iconSystem = d.bool(forKey: "iconSystem") } },
+              json: { $0.iconSystem }),
+        .init(jsonKey: "wordStyle",
+              load: { c, d in
+                  if let s = d.string(forKey: "wordStyle"), let st = WordStyle(rawValue: s) { c.wordStyle = st }
+                  // 旧版本用的是布尔开关 thinkingWords，升级上来的用户从它迁移
+                  else if d.object(forKey: "thinkingWords") != nil { c.wordStyle = d.bool(forKey: "thinkingWords") ? .cute : .off }
+              },
+              json: { $0.wordStyle.rawValue }),
+        .init(jsonKey: "animStyle",
+              load: { c, d in if let s = d.string(forKey: "animStyle"), let st = AnimStyle(rawValue: s) { c.animStyle = st } },
+              json: { $0.animStyle.rawValue }),
+        // 提示音只影响菜单栏，浮窗不发声，所以不同步
+        .init(jsonKey: nil,
+              load: { c, d in if d.object(forKey: "soundThreshold") != nil { c.soundThreshold = d.double(forKey: "soundThreshold") } },
+              json: { $0.soundThreshold }),
+    ]
+
     func writeSharedConfig() {
         let p = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/statusbar/config.json")
-        let body: [String: Any] = [
-            "wordStyle": wordStyle.rawValue,
-            "backdropAlpha": backdropAlpha,
-            "backdropRadius": backdropRadius,
-            "animStyle": animStyle.rawValue,
-            "iconSystem": iconSystem,
-            "floatWindow": floatWindow,
-        ]
+        var body: [String: Any] = [:]
+        for setting in Self.sharedSettings where setting.jsonKey != nil {
+            body[setting.jsonKey!] = setting.json(self)
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         try? data.write(to: URL(fileURLWithPath: p))
     }
@@ -1287,15 +1440,18 @@ final class StatusController: NSObject, NSMenuDelegate {
         }
         statusItem.button?.toolTip = lead.map(sessionMenuLine)  // names repo + surface + state on hover
 
-        guard let lead = lead else { renderResting(); return }
+        guard let lead = lead else { syncPetFrames(eff: "idle"); renderResting(); return }
+        syncPetFrames(eff: lead.eff)
+        // 宠物模式下每个状态都有专属动作行，就该一直动；圆点只是没有素材时的退路。
+        let petMode = animStyle == .pet
         switch lead.eff {
         case "error":
             // 不设停留窗口（不同于 done 的 5 秒）：错误要一直亮到下一轮活动把它顶掉为止。
-            render(label: statusText(lead, eff: lead.eff), color: red, animate: false, startedAt: 0, dot: true)
+            render(label: statusText(lead, eff: lead.eff), color: red, animate: petMode, startedAt: 0, dot: !petMode)
         case "permission":
             // 原本这里写死 startedAt: 0，等待授权期间计时器直接消失——而这正是最想知道"卡了多久"
             // 的时刻。改传本轮起点；update.js 那侧也不再把 startedAt 抹成 0，两边配合才有钟。
-            render(label: statusText(lead, eff: lead.eff), color: amber, animate: false, startedAt: lead.startedAt, dot: true)
+            render(label: statusText(lead, eff: lead.eff), color: amber, animate: petMode, startedAt: lead.startedAt, dot: !petMode)
         case "thinking", "tool":
             render(label: statusText(lead, eff: lead.eff), color: iconColor, animate: true, startedAt: lead.startedAt)
         default:
@@ -1303,14 +1459,17 @@ final class StatusController: NSObject, NSMenuDelegate {
             // 刚跑完的几秒亮绿灯，之后退回静默：既看得见"结束了"，又不长期占菜单栏。
             // tick() 每 0.4s 重跑 evaluate，窗口一过自然切走，不需要额外的定时器。
             if lead.state == "done", Date().timeIntervalSince1970 - lead.ts < doneFlashWindow {
-                render(label: statusText(lead, eff: lead.eff), color: green, animate: false, startedAt: 0, dot: true)
+                render(label: statusText(lead, eff: lead.eff), color: green, animate: petMode, startedAt: 0, dot: !petMode)
             } else {
                 renderResting()
             }
         }
     }
 
-    func renderResting() { render(label: "", color: iconColor, animate: false, startedAt: 0) }
+    // 空闲时宠物照样待机（idle 行），非宠物模式则静止在 logo 上
+    func renderResting() {
+        render(label: "", color: iconColor, animate: animStyle == .pet, startedAt: 0)
+    }
 
     // Per-session effective state with two recovery nets: an absolute age cap, plus the transcript
     // "interrupted by user" marker (Esc / denied permission fire no hook, freezing the file). "done"
@@ -1496,6 +1655,88 @@ final class StatusController: NSObject, NSMenuDelegate {
         list.compactMap { Data(base64Encoded: $0).flatMap(NSImage.init(data:)) }
     }
 
+
+    // 与浮窗读同一处：~/.codex/config.toml 的 selected-avatar-id = "custom:<id>"。
+    // 不要用 global-state 里的 first-awake-pet-notification-avatar-ids，那是安装历史。
+    func codexSelectedPet() -> String? {
+        let want = petId.trimmingCharacters(in: .whitespaces)
+        if want.caseInsensitiveCompare("none") == .orderedSame { return nil }
+        if !want.isEmpty && want.caseInsensitiveCompare("auto") != .orderedSame {
+            return petSheetPath(want) != nil ? want : nil
+        }
+        let cfg = (NSHomeDirectory() as NSString).appendingPathComponent(".codex/config.toml")
+        if let text = try? String(contentsOfFile: cfg, encoding: .utf8) {
+            for line in text.split(separator: "\n") where line.hasPrefix("selected-avatar-id") {
+                let v = line.split(separator: "=").last?
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " \"")) ?? ""
+                guard v.hasPrefix("custom:") else { return nil }  // "codex" 内置宠物没有本地素材
+                let id = String(v.dropFirst("custom:".count))
+                return petSheetPath(id) != nil ? id : nil
+            }
+        }
+        return installedPets().first?.0
+    }
+
+    func petSheetPath(_ id: String) -> String? {
+        let p = (codexPetsDir() as NSString).appendingPathComponent("\(id)/spritesheet.webp")
+        return FileManager.default.fileExists(atPath: p) ? p : nil
+    }
+
+    func petRow(for eff: String) -> Int {
+        switch eff {
+        case "error": return 5       // failed
+        case "permission": return 6  // waiting
+        case "tool": return 7        // running
+        case "thinking": return 8    // review
+        case "done": return 3        // waving
+        default: return 0            // idle
+        }
+    }
+
+    // 切出一行，丢掉行尾用于补满 8 列的空白格
+    func loadPetRow(_ row: Int) {
+        guard let sheet = petSheet,
+              let rep = sheet.representations.first,
+              let cg = (sheet.cgImage(forProposedRect: nil, context: nil, hints: nil)) else { return }
+        let fw = 192, fh = 208
+        let cols = rep.pixelsWide / fw, rows = rep.pixelsHigh / fh
+        guard cols > 0, row < rows else { return }
+        var out: [NSImage] = []
+        for c in 0..<cols {
+            let r = CGRect(x: c * fw, y: row * fh, width: fw, height: fh)
+            guard let sub = cg.cropping(to: r) else { continue }
+            // 抽样判断空白格
+            guard let ctx = CGContext(data: nil, width: fw, height: fh, bitsPerComponent: 8,
+                                      bytesPerRow: fw * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { continue }
+            ctx.draw(sub, in: CGRect(x: 0, y: 0, width: fw, height: fh))
+            guard let data = ctx.data else { continue }
+            let px = data.bindMemory(to: UInt8.self, capacity: fw * fh * 4)
+            var opaque = 0
+            for i in stride(from: 3, to: fw * fh * 4, by: 4 * 149) where px[i] > 8 { opaque += 1 }
+            if opaque < 2 { continue }
+            out.append(NSImage(cgImage: sub, size: NSSize(width: fw, height: fh)))
+        }
+        if !out.isEmpty { petRowFrames = out; petLoadedRow = row }
+    }
+
+    // 每次渲染前同步：宠物换了就重新解码，状态换了就换动作行
+    func syncPetFrames(eff: String) {
+        guard animStyle == .pet, let id = codexSelectedPet(), let path = petSheetPath(id) else { return }
+        if id != petSheetId {
+            petSheet = NSImage(contentsOfFile: path)
+            petSheetId = id
+            petLoadedRow = -1
+            iconCache.removeAll()
+        }
+        let row = petRow(for: eff)
+        if row != petLoadedRow {
+            loadPetRow(row)
+            iconCache.removeAll()   // 缓存键里没有行号，换行必须整体失效
+            frameIdx = 0
+        }
+    }
+
     func iconImage(color: NSColor?, frame: Int) -> NSImage {
         let key = "\(animStyle.rawValue)|\(frame)|\(color == nil ? "template" : color!.description)"
         if let cached = iconCache[key] { return cached }
@@ -1507,6 +1748,19 @@ final class StatusController: NSObject, NSMenuDelegate {
     func buildIconImage(color: NSColor?, frame: Int) -> NSImage {
         if animStyle == .web { return tint(frames, color: color, frame: frame) }
         if animStyle == .crab { return crabIcon(color: color, frame: frame) }
+        if animStyle == .pet {
+            // 宠物是彩色美术资源，不做 tint，保持原样缩放到菜单栏高度
+            guard !petRowFrames.isEmpty else { return NSImage(size: NSSize(width: 18, height: 18)) }
+            let src = petRowFrames[frame % petRowFrames.count]
+            let h: CGFloat = 18, w = (h * 192 / 208).rounded()
+            let img = NSImage(size: NSSize(width: w, height: h))
+            img.lockFocus()
+            NSGraphicsContext.current?.imageInterpolation = .high
+            src.draw(in: NSRect(x: 0, y: 0, width: w, height: h),
+                     from: .zero, operation: .sourceOver, fraction: 1)
+            img.unlockFocus()
+            return img
+        }
         let i = (frame / codeSub) % codeGlyphs.count
         let local = (CGFloat(frame % codeSub) + 0.5) / CGFloat(codeSub) // 0…1 within this glyph
         // Scale envelope per glyph: rise, hold at peak, fall, so each lands before the swap.
