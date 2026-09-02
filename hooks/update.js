@@ -6,6 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const cp = require("child_process");
+const plat = require("./platform.js");
 
 const dir = path.join(os.homedir(), ".claude", "statusbar");
 const stateDir = path.join(dir, "state.d");
@@ -183,11 +184,7 @@ process.stdin.on("end", () => {
   // Self-heal: a session with live state but no app to show it relaunches the app. Covers
   // install-while-a-session-is-already-open (that session never fires SessionStart, the only
   // other opener) and an app killed/crashed mid-session. Skipped after an explicit menu Quit.
-  try {
-    if (!fs.existsSync(quitMarker)) {
-      cp.execSync("pgrep -x ClaudeStatusBar", { stdio: "ignore" });
-    }
-  } catch {
-    try { cp.spawn("open", ["-g", "-b", "com.local.claudestatusbar"], { stdio: "ignore", detached: true }).unref(); } catch {}
+  if (!fs.existsSync(quitMarker) && !plat.isRunning()) {
+    plat.launch();
   }
 });

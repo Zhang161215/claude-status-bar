@@ -11,7 +11,7 @@ permissions:
   contents: write # 打 tag 时要建 Release
 
 jobs:
-  build:
+  macos:
     name: macOS
     runs-on: macos-latest
     steps:
@@ -31,7 +31,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             float/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('float/Cargo.lock') }}
+          key: macos-cargo-${{ hashFiles('float/Cargo.lock') }}
 
       - name: 编译
         # build.sh 会顺带编译 float/ 并把浮窗嵌进主 bundle 的 Contents/Helpers，
@@ -51,15 +51,14 @@ jobs:
             *) echo "::error::主程序不是通用二进制（$MAIN_ARCHS）"; exit 1 ;;
           esac
 
-          # hooks 脚本必须打进 Resources，否则首次启动无法自装
-          for f in update.js lifecycle.js install.js uninstall.js; do
+          # hooks 脚本必须打进 Resources，否则首次启动无法自装。
+          # platform.js 被 update/lifecycle 引用，漏了会在运行时报找不到模块。
+          for f in update.js lifecycle.js install.js uninstall.js platform.js; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::缺少 $f"; exit 1; }
           done
 
-          # 内嵌浮窗
           FLOAT="$APP/Contents/Helpers/Claude Float.app"
           test -d "$FLOAT" || { echo "::error::浮窗未嵌入"; exit 1; }
-          # LSUIElement 必须为真，否则浮窗会在 Dock 里留一个图标
           test "$(defaults read "$PWD/$FLOAT/Contents/Info.plist" LSUIElement)" = "1" \
             || { echo "::error::浮窗 LSUIElement 未生效"; exit 1; }
           FLOAT_ARCHS="$(lipo -archs "$FLOAT/Contents/MacOS/csb-float")"
@@ -68,7 +67,6 @@ jobs:
             *x86_64*arm64*|*arm64*x86_64*) ;;
             *) echo "::error::浮窗不是通用二进制（$FLOAT_ARCHS）"; exit 1 ;;
           esac
-
           echo "产物校验通过"
 
       - name: 打包
@@ -80,20 +78,97 @@ jobs:
 
       - uses: actions/upload-artifact@v5
         with:
-          name: ClaudeStatusBar-zh-macos
+          name: macos
           path: build/ClaudeStatusBar-zh-macos.zip
           retention-days: 30
 
-      - name: 发布 Release
-        if: startsWith(github.ref, 'refs/tags/')
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            float/target
+          key: windows-cargo-${{ hashFiles('float/Cargo.lock') }}
+
+      - name: 编译
+        # Windows 没有菜单栏，这个 exe 同时承担托盘和浮窗；托盘代码由
+        # cfg(not(target_os = "macos")) 控制，只在这边编译进来。
+        working-directory: float
+        run: cargo build --release
+
+      - name: 组装发布目录
+        shell: bash
+        run: |
+          mkdir -p dist/hooks
+          # platform.js 里检测进程用的是 claude-statusbar.exe，产物必须叫这个名字
+          cp float/target/release/csb-float.exe dist/claude-statusbar.exe
+          cp hooks/*.js dist/hooks/
+          cat > dist/使用说明.txt <<'TXT'
+          Claude Status Bar 汉化优化版 · Windows
+
+          1. 把整个文件夹放到一个固定位置，例如
+             %LOCALAPPDATA%\ClaudeStatusBar\
+          2. 双击 claude-statusbar.exe
+             首次运行会自动把 hooks 写入 %USERPROFILE%\.claude\settings.json
+             （改动前会自动备份），需要已安装 Node.js。
+          3. 托盘会出现一个圆点，颜色表示状态：
+             橙=干活中  黄=等你授权  绿=完成/空闲  红=出错
+             右键可以显示/隐藏浮窗、退出。
+
+          卸载：右键退出后运行 node hooks\uninstall.js 清理 hooks，再删掉本文件夹。
+
+          注意：本版本尚未在 Windows 上充分实测，遇到问题请到 GitHub 提 issue。
+          TXT
+          ls -R dist
+
+      - name: 校验产物
+        shell: bash
+        run: |
+          test -f dist/claude-statusbar.exe || { echo "::error::exe 未生成"; exit 1; }
+          for f in install.js update.js lifecycle.js uninstall.js platform.js; do
+            test -f "dist/hooks/$f" || { echo "::error::缺少 hooks/$f"; exit 1; }
+          done
+          echo "exe 大小: $(du -h dist/claude-statusbar.exe | cut -f1)"
+
+      - name: 打包
+        shell: pwsh
+        run: Compress-Archive -Path dist\* -DestinationPath ClaudeStatusBar-zh-windows.zip
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows
+          path: ClaudeStatusBar-zh-windows.zip
+          retention-days: 30
+
+  release:
+    name: 发布
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: 建 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" build/ClaudeStatusBar-zh-macos.zip \
+          gh release create "${GITHUB_REF_NAME}" \
+            artifacts/macos/ClaudeStatusBar-zh-macos.zip \
+            artifacts/windows/ClaudeStatusBar-zh-windows.zip \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            --notes "**仅 macOS**（12.0+，Intel 与 Apple Silicon 通用）。桌面浮窗已内置在 app 里，无需单独安装。
+            --notes "**macOS**（12.0+，Intel 与 Apple Silicon 通用）— 桌面浮窗已内置在 app 里，无需单独安装。
+          ad-hoc 签名，首次打开会被 Gatekeeper 拦：右键点图标 → 打开 → 再点「打开」，
+          或执行 \`xattr -dr com.apple.quarantine \"/Applications/Claude Status Bar.app\"\`。
 
-          > 本构建为 **ad-hoc 签名**（无 Apple Developer ID），首次打开会被 Gatekeeper 拦截。
-          > 右键点图标 → 打开 → 再点「打开」，或执行：
-          > \`xattr -dr com.apple.quarantine \"/Applications/Claude Status Bar.app\"\`"
+          **Windows** — 托盘 + 浮窗，需要已安装 Node.js。解压后双击 exe 即可，首次运行自动写入 hooks。
+          ⚠️ Windows 版为首个版本，尚未充分实测，欢迎提 issue。"

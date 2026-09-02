@@ -52,7 +52,8 @@ PLIST
 
 # Bundle the hook scripts (so first-launch self-install works) and the app icon.
 mkdir -p "$APP/Contents/Resources"
-cp hooks/update.js hooks/lifecycle.js hooks/install.js hooks/uninstall.js "$APP/Contents/Resources/"
+# platform.js 被 update/lifecycle 引用，漏拷会在运行时报找不到模块
+cp hooks/*.js "$APP/Contents/Resources/"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp assets/completion.mp3 "$APP/Contents/Resources/completion.mp3"
 

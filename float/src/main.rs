@@ -3,6 +3,9 @@
 // 外观读同目录的 config.json（菜单栏 App 写的）。所以菜单栏改设置，这边跟着变。
 
 mod crab;
+// 托盘只在非 macOS 编译：macOS 的菜单栏由 Swift App 负责，两个都出来会重复
+#[cfg(not(target_os = "macos"))]
+mod tray;
 
 use eframe::egui;
 use serde::Deserialize;
@@ -367,6 +370,10 @@ struct App {
     pet_img: Option<image::RgbaImage>,        // 宠物雪碧图，整张只解码一次
     pet_loaded_id: String,
     pet_rows: std::collections::HashMap<usize, Anim>, // 行 -> 动画，按需切分并缓存
+    #[cfg(not(target_os = "macos"))]
+    tray: Option<tray::Tray>,
+    // 托盘菜单里临时隐藏浮窗，不写配置（区别于菜单栏那个持久开关）
+    float_hidden: bool,
 }
 
 impl App {
@@ -382,6 +389,9 @@ impl App {
             pet_img: None,
             pet_loaded_id: String::new(),
             pet_rows: std::collections::HashMap::new(),
+            #[cfg(not(target_os = "macos"))]
+            tray: None,
+            float_hidden: false,
         }
     }
 
@@ -480,6 +490,36 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // 托盘要等事件循环起来才能建，所以放在这里惰性初始化而不是 new() 里
+            if self.tray.is_none() {
+                self.tray = tray::Tray::new();
+            }
+            if let Some(t) = &mut self.tray {
+                let (st, lb) = match &self.lead {
+                    Some(s) => (s.state.clone(), s.label.clone()),
+                    None => ("idle".to_string(), String::new()),
+                };
+                t.sync(&st, &lb);
+                let (tid, qid) = (t.id_toggle_float.clone(), t.id_quit.clone());
+                for id in tray::Tray::poll_menu() {
+                    if id == tid {
+                        self.float_hidden = !self.float_hidden;
+                    } else if id == qid {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                }
+            }
+            // 托盘常驻，浮窗可以单独收起来
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!self.float_hidden));
+            if self.float_hidden {
+                ctx.request_repaint_after(Duration::from_millis(500));
+                return;
+            }
+        }
 
         // 菜单栏把开关关掉了就自行退出。由被控方主动退出，菜单栏那边不必去找 pid 杀进程。
         if !self.cfg.float_window {
@@ -685,7 +725,33 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+// Windows 上没有 Swift 主程序来装 hooks，所以由这个 exe 自己来：首次运行时
+// 发现 ~/.claude/statusbar/update.js 不在，就调同目录下的 hooks/install.js 装一遍。
+// 用户解压完直接双击 exe 即可，不用再跑安装脚本。
+#[cfg(not(target_os = "macos"))]
+fn ensure_hooks_installed() {
+    let Some(home) = dirs::home_dir() else { return };
+    if home.join(".claude/statusbar/update.js").exists() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let installer = dir.join("hooks").join("install.js");
+    if !installer.exists() {
+        eprintln!("未找到 hooks/install.js，跳过自动安装");
+        return;
+    }
+    match std::process::Command::new("node").arg(&installer).status() {
+        Ok(st) if st.success() => eprintln!("hooks 已安装"),
+        Ok(st) => eprintln!("hooks 安装失败，退出码 {st}"),
+        Err(e) => eprintln!("找不到 node，无法安装 hooks: {e}"),
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    ensure_hooks_installed();
+
     // 初始窗口高度也要照配置来，否则启动瞬间会闪一下默认尺寸再跳变
     let boot = read_cfg();
     let boot_h = WIN_H_MIN.max(boot.anim_height.clamp(10.0, 64.0) + 12.0);

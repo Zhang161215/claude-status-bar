@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const cp = require("child_process");
+const plat = require("./platform.js");
 
 const BUNDLE_ID = "com.local.claudestatusbar";
 const EXEC = "ClaudeStatusBar";
@@ -14,7 +15,7 @@ const event = process.argv[2];
 
 fs.mkdirSync(stateDir, { recursive: true });
 
-const running = () => { try { cp.execSync(`pgrep -x ${EXEC}`, { stdio: "ignore" }); return true; } catch { return false; } };
+const running = () => plat.isRunning();
 const safeId = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "unknown";
 
 const writeAtomic = (file, obj) => {
@@ -49,7 +50,7 @@ function run() {
       // the dropdown until it has real activity (update.js flips started:true on a prompt/tool).
       writeAtomic(statePath, { state: "idle", label: "", tool: "", project: cwd ? path.basename(cwd) : "", cwd, sessionId: id, transcript: "", entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT || "", term_program: process.env.TERM_PROGRAM || "", pid: process.ppid, started: false, startedAt: 0, ts: Math.floor(Date.now() / 1000) });
     } catch {}
-    cp.spawn("open", ["-g", "-b", BUNDLE_ID], { stdio: "ignore", detached: true }).unref();
+    plat.launch();
   } else if (event === "end") {
     // Removing the file drops this session from the aggregate — this is also what recovers a
     // frozen animation on force-quit (SessionEnd fires, but no Stop). No state rewrite needed.
