@@ -379,6 +379,7 @@ final class StatusController: NSObject, NSMenuDelegate {
     // 文字底下的垫片。菜单栏透明，彩色文字直接压在壁纸上会糊，垫一层半透明底能稳住对比度。
     // 用 button.layer 而不是 NSVisualEffectView：状态栏按钮的图标和文字是它自己 draw 的，任何子视图
     // 都会盖在上面（真磨砂因此做不了）；layer 位于自绘内容之下，且天然铺满整个按钮，图标一起罩住。
+    var floatWindow = false            // 独立的浮窗进程（Claude Float.app）
     var backdropAlpha: Double = 0.22   // 0 = 关闭
     var backdropRadius: Double = 5
     // Tinted frames are deterministic per (style, frame, color); rebuilding one per animation
@@ -404,7 +405,6 @@ final class StatusController: NSObject, NSMenuDelegate {
     // 取代了早期的布尔开关 "thinkingWords"，旧值在 loadSettings 里迁移。
     enum WordStyle: String { case cute, plain, english, off }
     var wordStyle: WordStyle = .cute
-    var sessionWord: [String: String] = [:] // id -> current thinking word; re-picked on each entry into "thinking"
     var soundThreshold: Double = 0  // 0 = off; else the min turn length (seconds) that chimes on completion
     var turnStart: [String: Double] = [:]  // id -> active turn start, for the completion-sound length gate
     lazy var completionSound: NSSound? = {
@@ -413,55 +413,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         s.volume = 0.7 // the clip is loud at full system volume; play it a bit softer
         return s
     }()
-    // 一份数据喂两种中文风格：plain 只取词，cute 再拼上颜文字。避免维护两份词表走样。
-    // 颜文字逐字验过系统字体回退链，无缺字形；拼接后最宽一条约 120pt，与原版最长的
-    // "Metamorphosing…"（116pt）基本持平，拥挤的菜单栏里不会被挤掉。
-    let wordPairs: [(String, String)] = [
-        ("思考中", "(・ω・)"), ("琢磨中", "(´･ω･`)"), ("推敲中", "(｀･ω･´)"), ("冥想中", "(－ω－)"),
-        ("沉思中", "(・_・)"), ("发呆中", "(◎_◎)"), ("走神中", "(｡･ω･｡)"), ("酝酿中", "✧"),
-        ("构思中", "☆"), ("孵化中", "(´• ω •`)"), ("发酵中", "～"), ("炖着呢", "♨"),
-        ("搬砖中", "(>_<)"), ("码字中", "✍"), ("敲代码", "(・´ω`・)"), ("狂输出", "✦"),
-        ("苦干中", "(>﹏<)"), ("加速中", "♪"), ("摸鱼中", "(￣▽￣)"), ("划水中", "～"),
-        ("装忙中", "(・∀・)"), ("打盹中", "(－_－)"), ("神游中", "(￣ω￣)"), ("施法中", "✧"),
-        ("炼丹中", "♨"), ("召唤中", "★"), ("占卜中", "☆"), ("通灵中", "(⊙_⊙)"),
-        ("挠头中", "(・・?)"), ("打转中", "(@_@)"), ("冒烟中", "(×_×)"), ("卡壳中", "(・・;)"),
-        ("蒙圈中", "(⊙﹏⊙)"), ("灵光闪", "✦"), ("开窍了", "(☆▽☆)"), ("顿悟中", "(・∀・)"),
-        ("有谱了", "(｀・ω・´)"), ("捣鼓中", "(・ω・)ノ"), ("鼓捣中", "♪"), ("折腾中", "(￣ー￣)")]
-    // Claude Code 的 SPINNER_VERBS，去掉带连字符/绕口的那些。上游原版，english 风格用。
-    let englishWords = [
-        "Accomplishing", "Actioning", "Actualizing", "Architecting", "Baking", "Beaming", "Beboppin'",
-        "Befuddling", "Billowing", "Blanching", "Bloviating", "Boogieing", "Boondoggling", "Booping",
-        "Bootstrapping", "Brewing", "Bunning", "Burrowing", "Calculating", "Canoodling", "Caramelizing",
-        "Cascading", "Catapulting", "Cerebrating", "Channeling", "Channelling", "Churning", "Clauding",
-        "Coalescing", "Cogitating", "Combobulating", "Composing", "Computing", "Concocting", "Considering",
-        "Contemplating", "Cooking", "Crafting", "Creating", "Crunching", "Crystallizing", "Cultivating",
-        "Deciphering", "Deliberating", "Determining", "Doing", "Doodling", "Drizzling", "Ebbing",
-        "Effecting", "Elucidating", "Embellishing", "Enchanting", "Envisioning", "Evaporating", "Fermenting",
-        "Finagling", "Flambéing", "Flowing", "Flummoxing", "Fluttering", "Forging", "Forming", "Frolicking",
-        "Gallivanting", "Galloping", "Garnishing", "Generating", "Gesticulating", "Germinating", "Gitifying",
-        "Grooving", "Gusting", "Harmonizing", "Hashing", "Hatching", "Herding", "Honking", "Hullaballooing",
-        "Hyperspacing", "Ideating", "Imagining", "Improvising", "Incubating", "Inferring", "Infusing",
-        "Ionizing", "Jitterbugging", "Julienning", "Kneading", "Leavening", "Levitating", "Lollygagging",
-        "Manifesting", "Marinating", "Meandering", "Metamorphosing", "Misting", "Moonwalking", "Moseying",
-        "Mulling", "Mustering", "Musing", "Nebulizing", "Nesting", "Noodling", "Nucleating", "Orbiting",
-        "Orchestrating", "Osmosing", "Perambulating", "Percolating", "Perusing", "Pollinating", "Pondering",
-        "Pontificating", "Pouncing", "Precipitating", "Processing", "Proofing", "Propagating", "Puttering",
-        "Puzzling", "Quantumizing", "Razzmatazzing", "Reticulating", "Roosting", "Ruminating", "Sautéing",
-        "Scampering", "Schlepping", "Scurrying", "Seasoning", "Shenaniganing", "Shimmying", "Simmering",
-        "Skedaddling", "Sketching", "Slithering", "Smooshing", "Spelunking", "Spinning", "Sprouting",
-        "Stewing", "Sublimating", "Swirling", "Swooping", "Symbioting", "Synthesizing", "Tempering",
-        "Thinking", "Thundering", "Tinkering", "Tomfoolering", "Transfiguring", "Transmuting", "Twisting",
-        "Undulating", "Unfurling", "Unravelling", "Vibing", "Waddling", "Wandering", "Warping",
-        "Whirlpooling", "Whirring", "Whisking", "Wibbling", "Working", "Wrangling", "Zesting", "Zigzagging"]
-    // 当前风格的词库。省略号统一在这里补齐，workingLabel 拿到的就是成品。off 返回空表示不轮换。
-    var thinkingWords: [String] {
-        switch wordStyle {
-        case .cute:    return wordPairs.map { "\($0.0)… \($0.1)" }
-        case .plain:   return wordPairs.map { "\($0.0)…" }
-        case .english: return englishWords.map { $0 + "…" }
-        case .off:     return []
-        }
-    }
+    // 词库和选词逻辑已移到 hooks/update.js：菜单栏、浮窗、Windows 端都只读 label 字段，
+    // 这样同一时刻各端显示的词必然一致。这里只保留风格枚举，切换时写 config.json 通知 JS。
     var iconColor: NSColor? { iconSystem ? nil : brand } // nil => render as an adaptive template
     let codeGlyphs = ["✻", "✽", "✶", "✳", "✢"]
     let codePeaks: [CGFloat] = [1.0, 1.0, 1.0, 1.0, 1.0]
@@ -493,6 +446,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         super.init()
         let d = UserDefaults.standard
         if d.object(forKey: "showTimer") != nil { showTimer = d.bool(forKey: "showTimer") }
+        if d.object(forKey: "floatWindow") != nil { floatWindow = d.bool(forKey: "floatWindow") }
         if d.object(forKey: "backdropAlpha") != nil { backdropAlpha = d.double(forKey: "backdropAlpha") }
         if d.object(forKey: "backdropRadius") != nil { backdropRadius = d.double(forKey: "backdropRadius") }
         if d.object(forKey: "iconSystem") != nil { iconSystem = d.bool(forKey: "iconSystem") }
@@ -501,6 +455,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         else if d.object(forKey: "thinkingWords") != nil { wordStyle = d.bool(forKey: "thinkingWords") ? .cute : .off }
         if d.object(forKey: "soundThreshold") != nil { soundThreshold = d.double(forKey: "soundThreshold") }
         if let s = d.string(forKey: "animStyle"), let st = AnimStyle(rawValue: s) { animStyle = st }
+        if floatWindow { launchFloatApp() }
+        writeSharedConfig()  // 启动时同步一次，保证 update.js 拿到的是当前风格而不是默认值
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -732,6 +688,13 @@ final class StatusController: NSObject, NSMenuDelegate {
             UserDefaults.standard.set(on, forKey: "showTimer")
             self?.applyTitle()
         })
+        menu.addItem(toggleRow(title: "桌面浮窗", isOn: floatWindow) { [weak self] on in
+            guard let self else { return }
+            self.floatWindow = on
+            UserDefaults.standard.set(on, forKey: "floatWindow")
+            self.writeSharedConfig()   // 关掉时浮窗读到 false 会自己退出
+            if on { self.launchFloatApp() }
+        })
         let wordParent = NSMenuItem(title: "思考词", action: nil, keyEquivalent: "")
         let wordSub = NSMenu()
         for (style, name) in [(WordStyle.cute, "可爱（带颜文字）"), (WordStyle.plain, "简洁"),
@@ -927,10 +890,14 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     func statusText(_ s: Session, eff: String) -> String {
+        // label 由 update.js 统一产出（含思考词和颜文字），菜单栏、浮窗、Windows 端读的是同一个
+        // 字段，显示才可能一致。这里绝不能再自己拼一套文案。
+        if !s.label.isEmpty { return s.label }
+        // 兜底：老版本状态文件没有 label 时才走到这
         switch eff {
-        case "error":            return s.label.isEmpty ? "出错了 (×_×)" : s.label
+        case "error":            return "出错了 (×_×)"
         case "permission":       return "等待授权 (・・?)"
-        case "thinking", "tool": return workingLabel(s)
+        case "thinking", "tool": return s.state == "tool" ? "工作中…" : "思考中…"
         default:                 return s.state == "done" ? "已完成 (・∀・)" : "空闲 (－ω－)"
         }
     }
@@ -1030,23 +997,9 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     func workingLabel(_ s: Session) -> String {
-        // 词库里已经带好省略号（"思考中… (・ω・)" / "Percolating…"），这里不再补，否则双省略号
-        if wordStyle != .off, s.state == "thinking", let w = sessionWord[s.id], !w.isEmpty { return w }
+        // label 已经是 update.js 选好的成品词（自带省略号），这里不再加工
         if !s.label.isEmpty { return s.label }
         return s.state == "tool" ? "工作中…" : "思考中…"
-    }
-
-    // Re-pick a word each time a session ENTERS the thinking state (prompt, or a tool->thinking `post`),
-    // avoiding an immediate repeat, so a tool round-trip lands a different word. Held steady while the
-    // session stays thinking. Computed regardless of the toggle so flipping it on shows instantly.
-    func updateThinkingWord(_ s: Session) {
-        let prev = prevState[s.id] ?? ""
-        guard s.state == "thinking", prev != "thinking" else { return }
-        let words = thinkingWords   // 计算属性，取一次存下来，别在下面的循环里反复 map
-        guard !words.isEmpty else { sessionWord[s.id] = nil; return }  // off 风格：不轮换，退回固定文案
-        var w = words.randomElement() ?? ""
-        if words.count > 1 { while w == sessionWord[s.id] { w = words.randomElement() ?? w } }
-        sessionWord[s.id] = w
     }
 
     // "1m 1s" / "43s" — Claude Code's elapsed-clock style.
@@ -1100,16 +1053,32 @@ final class StatusController: NSObject, NSMenuDelegate {
         UserDefaults.standard.set(iconSystem, forKey: "iconSystem")
         iconCache.removeAll()
         evaluate() // re-render the current state in the new color
+        writeSharedConfig()
     }
 
     // 两个选择器都得先清 lastTitleText：applyTitle 拿文字内容当重绘缓存键，底色变了但词没变时
     // 会被缓存吃掉，点了菜单看不到变化。
+    // 浮窗是独立的 Claude Float.app（Rust 写的，跨平台，Windows 版会复用同一份代码）。
+    // 这里只负责把它拉起来；关闭走 config.json，由它自己退出。
+    func launchFloatApp() {
+        let p = "/Applications/Claude Float.app"
+        guard FileManager.default.fileExists(atPath: p) else {
+            NSLog("Claude Float.app 未安装，跳过启动")
+            return
+        }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = false      // 别抢焦点
+        cfg.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: p), configuration: cfg)
+    }
+
     @objc func chooseBackdropAlpha(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
         backdropAlpha = n.doubleValue
         UserDefaults.standard.set(backdropAlpha, forKey: "backdropAlpha")
         lastTitleText = nil
         evaluate()
+        writeSharedConfig()
     }
 
     @objc func chooseBackdropRadius(_ sender: NSMenuItem) {
@@ -1118,6 +1087,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         UserDefaults.standard.set(backdropRadius, forKey: "backdropRadius")
         lastTitleText = nil
         evaluate()
+        writeSharedConfig()
     }
 
     @objc func chooseSound(_ sender: NSMenuItem) {
@@ -1134,17 +1104,30 @@ final class StatusController: NSObject, NSMenuDelegate {
         animTimer?.invalidate(); animTimer = nil // recreate at the new style's fps
         frameIdx = 0
         evaluate()
+        writeSharedConfig()
     }
 
     @objc func chooseWordStyle(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let st = WordStyle(rawValue: raw) else { return }
         wordStyle = st
         UserDefaults.standard.set(raw, forKey: "wordStyle")
-        // 正在 thinking 的会话手里还攥着旧风格的词，而 updateThinkingWord 只在"进入"thinking 时换词，
-        // 不在这儿重挑的话，切完风格得等下一轮才见效。keys 先快照，避免遍历中改字典。
-        let words = thinkingWords
-        for id in Array(sessionWord.keys) { sessionWord[id] = words.randomElement() }  // words 为空时置 nil，退回固定文案
-        evaluate()
+        writeSharedConfig()   // 真正决定用哪套词的是 update.js，得把选择传过去
+    }
+
+    // 与 hooks 和浮窗共享的配置。update.js 用 wordStyle 选词；浮窗读外观项，
+    // 这样菜单栏改了设置，浮窗跟着一起变，不用各调各的。
+    func writeSharedConfig() {
+        let p = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/statusbar/config.json")
+        let body: [String: Any] = [
+            "wordStyle": wordStyle.rawValue,
+            "backdropAlpha": backdropAlpha,
+            "backdropRadius": backdropRadius,
+            "animStyle": animStyle.rawValue,
+            "iconSystem": iconSystem,
+            "floatWindow": floatWindow,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        try? data.write(to: URL(fileURLWithPath: p))
     }
 
     // MARK: state polling
@@ -1267,15 +1250,14 @@ final class StatusController: NSObject, NSMenuDelegate {
                                  : (s.eff == "idle" && stalePruneAge > 0 && now - s.ts > stalePruneAge)
             if dead {
                 try? FileManager.default.removeItem(atPath: (stateDir as NSString).appendingPathComponent(id + ".json"))
-                sessions[id] = nil; fileMTimes[id + ".json"] = nil; prevState[id] = nil; sessionWord[id] = nil; turnStart[id] = nil
+                sessions[id] = nil; fileMTimes[id + ".json"] = nil; prevState[id] = nil; turnStart[id] = nil
                 continue
             }
             sessions[id] = s
-            updateThinkingWord(s)
             if completionEdge(s, now: now) { chime = true }
             prevState[s.id] = s.state
         }
-        for id in Array(prevState.keys) where sessions[id] == nil { prevState[id] = nil; sessionWord[id] = nil; turnStart[id] = nil }
+        for id in Array(prevState.keys) where sessions[id] == nil { prevState[id] = nil; turnStart[id] = nil }
         if chime { completionSound?.play() }
 
         // Same-named projects (two clones/worktrees of one repo) get a parent-folder qualifier

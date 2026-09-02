@@ -51,14 +51,50 @@ jobs:
           path: build/ClaudeStatusBar-zh.zip
           retention-days: 30
 
+      # ---- 桌面浮窗（独立的 Rust 程序，与菜单栏 App 共用状态与配置）----
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            float/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('float/Cargo.lock') }}
+
+      - name: 编译浮窗
+        working-directory: float
+        run: ./build.sh
+
+      - name: 打包浮窗
+        run: |
+          APP="float/build/Claude Float.app"
+          test -d "$APP" || { echo "::error::浮窗未生成"; exit 1; }
+          # LSUIElement 必须为真，否则会在 Dock 里留一个图标
+          test "$(defaults read "$PWD/$APP/Contents/Info.plist" LSUIElement)" = "1" \
+            || { echo "::error::LSUIElement 未生效"; exit 1; }
+          cd float/build
+          ditto -c -k --sequesterRsrc --keepParent "Claude Float.app" ClaudeFloat-zh.zip
+          echo "大小: $(du -h ClaudeFloat-zh.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ClaudeFloat-zh
+          path: float/build/ClaudeFloat-zh.zip
+          retention-days: 30
+
       - name: 发布 Release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" build/ClaudeStatusBar-zh.zip \
+          gh release create "${GITHUB_REF_NAME}" \
+            build/ClaudeStatusBar-zh.zip \
+            float/build/ClaudeFloat-zh.zip \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            --notes "> 本构建为 **ad-hoc 签名**（无 Apple Developer ID），首次打开会被 Gatekeeper 拦截。
-            > 右键点图标 → 打开 → 再点「打开」，或执行：
-            > \`xattr -dr com.apple.quarantine \"/Applications/Claude Status Bar.app\"\`"
+            --notes "**ClaudeStatusBar-zh.zip** — 菜单栏主程序（必装）
+          **ClaudeFloat-zh.zip** — 桌面浮窗（可选，装了才能在「选项 → 桌面浮窗」里打开）
+
+          > 两者均为 **ad-hoc 签名**（无 Apple Developer ID），首次打开会被 Gatekeeper 拦截。
+          > 右键点图标 → 打开 → 再点「打开」，或执行：
+          > \`xattr -dr com.apple.quarantine \"/Applications/Claude Status Bar.app\"\`"

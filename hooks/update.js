@@ -21,6 +21,57 @@ const TOOL_LABELS = {
   TodoWrite: "规划中",
 };
 
+// 思考词在这里选，不在各个前端里选。菜单栏 App、浮窗、将来的 Windows 端都只读 label，
+// 天然一致；否则各选各的，同一时刻两个窗口显示不同的词。
+// 风格由 config.json 的 wordStyle 决定，菜单栏 App 改设置时会写这个文件。
+const WORD_PAIRS = [
+  ["思考中", "(・ω・)"], ["琢磨中", "(´･ω･`)"], ["推敲中", "(｀･ω･´)"], ["冥想中", "(－ω－)"],
+  ["沉思中", "(・_・)"], ["发呆中", "(◎_◎)"], ["走神中", "(｡･ω･｡)"], ["酝酿中", "✧"],
+  ["构思中", "☆"], ["孵化中", "(´• ω •`)"], ["发酵中", "～"], ["炖着呢", "♨"],
+  ["搬砖中", "(>_<)"], ["码字中", "✍"], ["敲代码", "(・´ω`・)"], ["狂输出", "✦"],
+  ["苦干中", "(>﹏<)"], ["加速中", "♪"], ["摸鱼中", "(￣▽￣)"], ["划水中", "～"],
+  ["装忙中", "(・∀・)"], ["打盹中", "(－_－)"], ["神游中", "(￣ω￣)"], ["施法中", "✧"],
+  ["炼丹中", "♨"], ["召唤中", "★"], ["占卜中", "☆"], ["通灵中", "(⊙_⊙)"],
+  ["挠头中", "(・・?)"], ["打转中", "(@_@)"], ["冒烟中", "(×_×)"], ["卡壳中", "(・・;)"],
+  ["蒙圈中", "(⊙﹏⊙)"], ["灵光闪", "✦"], ["开窍了", "(☆▽☆)"], ["顿悟中", "(・∀・)"],
+  ["有谱了", "(｀・ω・´)"], ["捣鼓中", "(・ω・)ノ"], ["鼓捣中", "♪"], ["折腾中", "(￣ー￣)"],
+];
+const ENGLISH_WORDS = [
+  "Accomplishing", "Actualizing", "Architecting", "Baking", "Brewing", "Calculating", "Cascading",
+  "Cerebrating", "Churning", "Clauding", "Cogitating", "Computing", "Concocting", "Considering",
+  "Contemplating", "Cooking", "Crafting", "Crunching", "Deciphering", "Deliberating", "Doodling",
+  "Effecting", "Envisioning", "Fermenting", "Forging", "Generating", "Germinating", "Hatching",
+  "Ideating", "Imagining", "Incubating", "Inferring", "Manifesting", "Marinating", "Mulling",
+  "Musing", "Noodling", "Orchestrating", "Percolating", "Pondering", "Processing", "Puzzling",
+  "Reticulating", "Ruminating", "Simmering", "Sketching", "Spinning", "Stewing", "Synthesizing",
+  "Thinking", "Tinkering", "Transmuting", "Whisking", "Working", "Wrangling",
+];
+
+function wordStyle() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8")).wordStyle || "cute";
+  } catch { return "cute"; }
+}
+
+function wordList(style) {
+  if (style === "plain") return WORD_PAIRS.map(([w]) => `${w}…`);
+  if (style === "english") return ENGLISH_WORDS.map((w) => `${w}…`);
+  return WORD_PAIRS.map(([w, k]) => `${w}… ${k}`);
+}
+
+// prev 传上一次的 label，避免连着抽到同一个词
+function pickWord(prev) {
+  const style = wordStyle();
+  if (style === "off") return "思考中…";
+  const list = wordList(style);
+  let w = list[Math.floor(Math.random() * list.length)];
+  if (list.length > 1) {
+    let guard = 0;
+    while (w === prev && guard++ < 8) w = list[Math.floor(Math.random() * list.length)];
+  }
+  return w;
+}
+
 const safeId = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "unknown";
 
 let raw = "";
@@ -55,7 +106,7 @@ process.stdin.on("end", () => {
 
   switch (event) {
     case "prompt":
-      state = "thinking"; label = "思考中…"; startedAt = ts; break;
+      state = "thinking"; label = pickWord(prev.label); startedAt = ts; break;
     case "pre": {
       const t = p.tool_name || "";
       state = "tool"; label = TOOL_LABELS[t] || "调用工具";
@@ -63,7 +114,8 @@ process.stdin.on("end", () => {
       break;
     }
     case "post":
-      state = "thinking"; label = "思考中…";
+      // 每次工具往返回到 thinking 都换个新词，和菜单栏版原先的行为一致
+      state = "thinking"; label = pickWord(prev.label);
       if (!startedAt) startedAt = ts;
       break;
     case "notify": {
@@ -76,17 +128,17 @@ process.stdin.on("end", () => {
       if (!isPerm) return;
       // 保留本轮起点而不是抹成 0：applyTitle 的条件是 startedAt > 0，置 0 会让计时器在整个
       // 等待授权期间消失——而授权确认恰恰是最想知道"卡了多久"的时候。
-      state = "permission"; label = "等待授权";
+      state = "permission"; label = "等待授权 (・・?)";
       if (!startedAt) startedAt = ts;
       break;
     }
     case "permreq":
       // Desktop-app permission signal; not redundant with notify (that's CLI-only).
-      state = "permission"; label = "等待授权";
+      state = "permission"; label = "等待授权 (・・?)";
       if (!startedAt) startedAt = ts;
       break;
     case "stop":
-      state = "done"; label = "完成"; startedAt = 0; break;
+      state = "done"; label = "已完成 (・∀・)"; startedAt = 0; break;
     case "fail": {
       // 两个来源共用：StopFailure（API 层错误，rate_limit/overloaded/server_error…，无 tool_name）
       // 和 PostToolUseFailure（工具调用失败，带 tool_name）。后者能指出是哪一步崩的，信息量更大。
