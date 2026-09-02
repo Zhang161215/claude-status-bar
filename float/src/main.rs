@@ -24,6 +24,7 @@ struct Session {
     #[serde(rename = "startedAt")]
     started_at: f64,
     ts: f64,
+    transcript: String,
 }
 
 // 菜单栏 App 写的共享外观配置
@@ -127,6 +128,38 @@ fn read_sessions() -> Vec<Session> {
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .filter_map(|s| serde_json::from_str::<Session>(&s).ok())
         .collect()
+}
+
+// 与菜单栏的 effectiveState 保持同一套规则，否则两处会显示不同的状态。
+fn effective_state(s: &Session) -> String {
+    let st = s.state.as_str();
+    if matches!(st, "thinking" | "tool" | "permission") {
+        // 陈旧上限：超过 15 分钟没动静就当空闲，别让死掉的会话一直占着显示
+        if now() - s.ts > 900.0 {
+            return "idle".into();
+        }
+        // Claude Code 没有「权限已批准」事件，permission 会一直卡到工具跑完。
+        // 但 transcript 只在会话真的产出内容时才写，等你点确认期间它不动 ——
+        // 所以它比状态文件新，就说明已经批准、工具在跑了。
+        // 只对 permission 成立：thinking 时 Claude 本就在输出，transcript 一直动。
+        if st == "permission" && !s.transcript.is_empty() {
+            if let Ok(m) = std::fs::metadata(&s.transcript) {
+                if let Ok(mt) = m.modified() {
+                    if let Ok(d) = mt.duration_since(UNIX_EPOCH) {
+                        if d.as_secs_f64() > s.ts + 3.0 {
+                            return "tool".into();
+                        }
+                    }
+                }
+            }
+        }
+        return st.into();
+    }
+    if st == "error" {
+        // 错误保留 4 小时兜底，防止残档永久卡住红灯
+        return if now() - s.ts > 14400.0 { "idle".into() } else { "error".into() };
+    }
+    if st == "done" { "done".into() } else { "idle".into() }
 }
 
 // 与菜单栏版一致：出错 > 等授权 > 干活 > 其他
@@ -359,7 +392,26 @@ impl App {
         }
         self.last_poll = t;
         self.cfg = read_cfg();
-        self.lead = read_sessions()
+        // 先按同一套规则归一化状态，再挑优先级最高的，避免拿陈旧状态去比
+        let mut sessions: Vec<Session> = read_sessions();
+        for s in &mut sessions {
+            let eff = effective_state(s);
+            if eff != s.state {
+                // 状态被判定为陈旧，label 是跟旧状态一起写下的，同样不能再用。
+                // permission→tool 时把「等待授权 · 执行命令」里的工具名摘出来接着用。
+                s.label = match eff.as_str() {
+                    "tool" => s
+                        .label
+                        .split_once(" · ")
+                        .map(|(_, t)| t.to_string())
+                        .unwrap_or_else(|| "工作中…".into()),
+                    "idle" => "空闲 (－ω－)".into(),
+                    _ => s.label.clone(),
+                };
+            }
+            s.state = eff;
+        }
+        self.lead = sessions
             .into_iter()
             .max_by(|a, b| priority(&a.state).cmp(&priority(&b.state)).then(a.ts.total_cmp(&b.ts)))
             .filter(|s| if s.state == "done" { now() - s.ts < 5.0 } else { s.state != "idle" });

@@ -942,7 +942,16 @@ final class StatusController: NSObject, NSMenuDelegate {
     func statusText(_ s: Session, eff: String) -> String {
         // label 由 update.js 统一产出（含思考词和颜文字），菜单栏、浮窗、Windows 端读的是同一个
         // 字段，显示才可能一致。这里绝不能再自己拼一套文案。
-        if !s.label.isEmpty { return s.label }
+        //
+        // 但 eff 与原始 state 不一致时例外：那说明 effectiveState 判定这条状态已经陈旧
+        // （比如 permission 被 transcript 证实已批准），此时 label 是和旧状态一起写下的，
+        // 同样陈旧，继续用它就会出现"状态是执行中、文字还写着等待授权"。
+        if eff == s.state, !s.label.isEmpty { return s.label }
+        // 陈旧的 permission 转成 tool：label 形如「等待授权 · 执行命令」，
+        // 把工具名摘出来接着用，比退回泛泛的「工作中…」有信息量。
+        if eff == "tool", let r = s.label.range(of: " · ") {
+            return String(s.label[r.upperBound...])
+        }
         // 兜底：老版本状态文件没有 label 时才走到这
         switch eff {
         case "error":            return "出错了 (×_×)"
@@ -1492,8 +1501,20 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func effectiveState(_ s: Session, now: Double) -> String {
         if s.state == "thinking" || s.state == "tool" || s.state == "permission" {
-            let cap: Double = s.state == "permission" ? 7200 : 900
-            if now - s.ts > cap { return "idle" }
+            // 陈旧上限。permission 原先给到 2 小时，结果一个没人管的授权请求能把菜单栏
+            // 霸占半天（它优先级仅次于 error），统一收到 15 分钟。
+            if now - s.ts > 900 { return "idle" }
+            // Claude Code 没有「权限已批准」事件，permission 会一直卡到工具跑完为止。
+            // 但 transcript 只在会话真的产出内容时才写 —— 等你点确认那段时间它是不动的。
+            // 所以 transcript 比状态文件新，就说明你已经批准、工具正在跑了。
+            // 这条只对 permission 成立：thinking 状态下 Claude 本来就在输出，
+            // transcript 一直在动，套用会把正常状态误判成陈旧。
+            if s.state == "permission", !s.transcript.isEmpty,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: s.transcript),
+               let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
+               mtime > s.ts + 3 {
+                return "tool"
+            }
             if !s.transcript.isEmpty, let last = cachedLastTurnLine(s.transcript),
                last.contains("interrupted by user") { return "idle" }
             return s.state
