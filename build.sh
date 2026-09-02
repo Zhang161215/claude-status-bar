@@ -56,6 +56,20 @@ cp hooks/update.js hooks/lifecycle.js hooks/install.js hooks/uninstall.js "$APP/
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp assets/completion.mp3 "$APP/Contents/Resources/completion.mp3"
 
+# 把浮窗作为 helper app 嵌进主 bundle：用户装一个 .app 就够了，不用再单独下载放置。
+# 需要 Rust 工具链；没装就跳过，主程序照常可用（浮窗开关会提示未安装）。
+if command -v cargo >/dev/null 2>&1; then
+    echo "编译内嵌浮窗…"
+    ( cd float && ./build.sh >/dev/null )
+    if [ -d "float/build/Claude Float.app" ]; then
+        mkdir -p "$APP/Contents/Helpers"
+        cp -R "float/build/Claude Float.app" "$APP/Contents/Helpers/"
+        echo "已嵌入 Contents/Helpers/Claude Float.app"
+    fi
+else
+    echo "未检测到 cargo，跳过浮窗（主程序不受影响）"
+fi
+
 # --- Signing / notarization ---
 # For a clean (no Gatekeeper warning) release you need, set up once on this Mac:
 #   1. A "Developer ID Application" certificate in your keychain (Xcode > Settings > Accounts).

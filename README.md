@@ -2,6 +2,8 @@
 
 在 macOS 菜单栏上显示 Claude Code 的实时状态：**橙灯干活中、黄灯等你授权、绿灯跑完了、红灯出错了**。
 
+> **平台：仅 macOS 12+**（Intel 与 Apple Silicon 通用二进制）。暂无 Windows / Linux 版本。
+
 > **本项目 Fork 自 [m1ckc3s/claude-status-bar](https://github.com/m1ckc3s/claude-status-bar)**，原作者 **Mick Cesanek**，MIT 协议。
 > 原版英文文档见 [README.en.md](README.en.md)。本分支做了完整中文化，并修复了若干上游问题、新增了状态配色等功能。
 > 非官方项目，与 Anthropic 无关联。
@@ -47,7 +49,9 @@
 
 ### 下载构建好的版本
 
-到 [Releases](https://github.com/Zhang161215/claude-status-bar/releases) 下载 `ClaudeStatusBar-zh.zip`，解压后把 `Claude Status Bar.app` 拖进「应用程序」，**打开一次**（这一步会自动写入 Claude Code hooks）。
+到 [Releases](https://github.com/Zhang161215/claude-status-bar/releases) 下载 `ClaudeStatusBar-zh-macos.zip`，解压后把 `Claude Status Bar.app` 拖进「应用程序」，**打开一次**（这一步会自动写入 Claude Code hooks）。
+
+桌面浮窗已内置在 app 内部（`Contents/Helpers/`），不需要单独下载或安装。
 
 > ⚠️ CI 构建的版本是 **ad-hoc 签名**（没有 Apple Developer ID），首次打开会被 Gatekeeper 拦。两种方式放行：
 > - 右键点图标 → 打开 → 再点「打开」
@@ -63,7 +67,7 @@ cp -R "build/Claude Status Bar.app" /Applications/
 open "/Applications/Claude Status Bar.app"
 ```
 
-**要求**：macOS 12+、Node.js（hooks 脚本用）、Xcode Command Line Tools（`xcode-select --install`）。
+**要求**：macOS 12+、Node.js（hooks 脚本用）、Xcode Command Line Tools（`xcode-select --install`）。浮窗需要 Rust 工具链（[rustup](https://rustup.rs)），没装会自动跳过。
 
 装了完整 Xcode 会输出 arm64 + x86_64 通用二进制；只有 Command Line Tools 则自动降级为仅本机架构，照常可用。
 
@@ -136,7 +140,9 @@ open "/Applications/Claude Status Bar.app"
 
 这样拆分也是为了将来支持 Windows —— 那边没有 macOS 菜单栏，浮窗这套代码可以直接复用。
 
-**开关联动**：打开时菜单栏会拉起 `Claude Float.app`；关闭时只写配置，由浮窗自己读到后退出。它带 `LSUIElement`，不占 Dock 图标。
+**它打包在主 app 内部**（`Contents/Helpers/Claude Float.app`），装一个 app 就够了。
+
+**开关联动**：打开时菜单栏从 bundle 内部拉起它；关闭时只写配置，由浮窗自己读到后退出。它带 `LSUIElement`，不占 Dock 图标。
 
 **空闲时自动收成纯宠物**：没有活跃会话时，浮窗会去掉胶囊底、隐藏文字、把宠物放大到 1.8 倍，只留一只贴在桌面上的宠物；有任务时再展开成完整状态条。
 
@@ -179,15 +185,15 @@ open "/Applications/Claude Status Bar.app"
 
 内置螃蟹动画（20 帧）提取自上游的 `CrabFrames.swift`，版权同属原作者。
 
-### 单独编译浮窗
+### 关于编译
+
+根目录的 `./build.sh` 会**顺带编译 `float/` 并把浮窗嵌进主 bundle**，所以正常情况下不用单独构建它。
+
+没装 Rust 工具链时会跳过浮窗，主程序照常可用（只是浮窗开关拉不起东西）。想单独调试浮窗：
 
 ```bash
-cd float
-./build.sh
-cp -R "build/Claude Float.app" /Applications/
+cd float && ./build.sh          # 产出 float/build/Claude Float.app
 ```
-
-需要 Rust 工具链（`rustup`）。产物是无依赖的单可执行文件，打包进 `.app` bundle。
 
 ## 工作原理
 
@@ -222,8 +228,8 @@ Claude Code 在会话生命周期的各个节点触发 hooks，`update.js` 把�
 发布新版本：
 
 ```bash
-git tag v0.4.4-zh.1
-git push origin v0.4.4-zh.1
+git tag v0.4.4-zh.5
+git push origin v0.4.4-zh.5
 ```
 
 ---

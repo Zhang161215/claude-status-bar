@@ -1164,9 +1164,14 @@ final class StatusController: NSObject, NSMenuDelegate {
     // 浮窗是独立的 Claude Float.app（Rust 写的，跨平台，Windows 版会复用同一份代码）。
     // 这里只负责把它拉起来；关闭走 config.json，由它自己退出。
     func launchFloatApp() {
-        let p = "/Applications/Claude Float.app"
-        guard FileManager.default.fileExists(atPath: p) else {
-            NSLog("Claude Float.app 未安装，跳过启动")
+        // 优先用打包在自己 bundle 里的那份，这样用户只需要装一个 app。
+        // 找不到再退回 /Applications —— 兼容老版本分开安装的情况。
+        let embedded = Bundle.main.bundlePath + "/Contents/Helpers/Claude Float.app"
+        let standalone = "/Applications/Claude Float.app"
+        let fm = FileManager.default
+        let p = fm.fileExists(atPath: embedded) ? embedded : standalone
+        guard fm.fileExists(atPath: p) else {
+            NSLog("找不到 Claude Float.app（既不在 bundle 内也不在 /Applications），跳过启动")
             return
         }
         let cfg = NSWorkspace.OpenConfiguration()

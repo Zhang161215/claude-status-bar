@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   build:
+    name: macOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -20,38 +21,9 @@ jobs:
         run: |
           swift --version
           xcodebuild -version
+          cargo --version
 
-      - name: 编译
-        # runner 装了完整 Xcode，所以这里能出 arm64 + x86_64 通用二进制；
-        # 只有 Command Line Tools 的机器会自动降级成本机架构（见 build.sh 注释）。
-        run: ./build.sh
-
-      - name: 校验产物
-        run: |
-          APP="build/Claude Status Bar.app"
-          test -d "$APP" || { echo "::error::未生成 .app"; exit 1; }
-          echo "架构: $(lipo -archs "$APP/Contents/MacOS/ClaudeStatusBar")"
-          codesign -dv "$APP" 2>&1 | grep -E "Signature|Identifier" || true
-          # hooks 脚本必须打进 Resources，否则首次启动无法自装
-          for f in update.js lifecycle.js install.js uninstall.js; do
-            test -f "$APP/Contents/Resources/$f" || { echo "::error::缺少 $f"; exit 1; }
-          done
-          echo "产物校验通过"
-
-      - name: 打包
-        # 用 ditto 而不是 zip：它能正确保留 .app 的符号链接和扩展属性
-        run: |
-          cd build
-          ditto -c -k --sequesterRsrc --keepParent "Claude Status Bar.app" ClaudeStatusBar-zh.zip
-          echo "大小: $(du -h ClaudeStatusBar-zh.zip | cut -f1)"
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: ClaudeStatusBar-zh
-          path: build/ClaudeStatusBar-zh.zip
-          retention-days: 30
-
-      # ---- 桌面浮窗（独立的 Rust 程序，与菜单栏 App 共用状态与配置）----
+      # 浮窗是 Rust 写的，编译较慢，缓存一下
       - name: 缓存 cargo
         uses: actions/cache@v4
         with:
@@ -61,32 +33,55 @@ jobs:
             float/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('float/Cargo.lock') }}
 
-      - name: 编译浮窗
-        working-directory: float
+      - name: 编译
+        # build.sh 会顺带编译 float/ 并把浮窗嵌进主 bundle 的 Contents/Helpers，
+        # 所以最终只产出一个 .app，用户装一个就够。
+        # runner 有完整 Xcode，能出 arm64 + x86_64 通用二进制。
         run: ./build.sh
 
-      - name: 打包浮窗
+      - name: 校验产物
         run: |
-          APP="float/build/Claude Float.app"
-          test -d "$APP" || { echo "::error::浮窗未生成"; exit 1; }
-          # LSUIElement 必须为真，否则会在 Dock 里留一个图标
-          test "$(defaults read "$PWD/$APP/Contents/Info.plist" LSUIElement)" = "1" \
-            || { echo "::error::LSUIElement 未生效"; exit 1; }
-          # runner 是 Apple Silicon，漏了交叉编译就会悄悄退化成 arm64-only，Intel Mac 跑不起来
-          ARCHS="$(lipo -archs "$APP/Contents/MacOS/csb-float")"
-          echo "浮窗架构: $ARCHS"
-          case "$ARCHS" in
+          APP="build/Claude Status Bar.app"
+          test -d "$APP" || { echo "::error::未生成 .app"; exit 1; }
+
+          MAIN_ARCHS="$(lipo -archs "$APP/Contents/MacOS/ClaudeStatusBar")"
+          echo "主程序架构: $MAIN_ARCHS"
+          case "$MAIN_ARCHS" in
             *x86_64*arm64*|*arm64*x86_64*) ;;
-            *) echo "::error::浮窗不是通用二进制（$ARCHS）"; exit 1 ;;
+            *) echo "::error::主程序不是通用二进制（$MAIN_ARCHS）"; exit 1 ;;
           esac
-          cd float/build
-          ditto -c -k --sequesterRsrc --keepParent "Claude Float.app" ClaudeFloat-zh.zip
-          echo "大小: $(du -h ClaudeFloat-zh.zip | cut -f1)"
+
+          # hooks 脚本必须打进 Resources，否则首次启动无法自装
+          for f in update.js lifecycle.js install.js uninstall.js; do
+            test -f "$APP/Contents/Resources/$f" || { echo "::error::缺少 $f"; exit 1; }
+          done
+
+          # 内嵌浮窗
+          FLOAT="$APP/Contents/Helpers/Claude Float.app"
+          test -d "$FLOAT" || { echo "::error::浮窗未嵌入"; exit 1; }
+          # LSUIElement 必须为真，否则浮窗会在 Dock 里留一个图标
+          test "$(defaults read "$PWD/$FLOAT/Contents/Info.plist" LSUIElement)" = "1" \
+            || { echo "::error::浮窗 LSUIElement 未生效"; exit 1; }
+          FLOAT_ARCHS="$(lipo -archs "$FLOAT/Contents/MacOS/csb-float")"
+          echo "浮窗架构: $FLOAT_ARCHS"
+          case "$FLOAT_ARCHS" in
+            *x86_64*arm64*|*arm64*x86_64*) ;;
+            *) echo "::error::浮窗不是通用二进制（$FLOAT_ARCHS）"; exit 1 ;;
+          esac
+
+          echo "产物校验通过"
+
+      - name: 打包
+        # 用 ditto 而不是 zip：它能正确保留 .app 的符号链接和扩展属性
+        run: |
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent "Claude Status Bar.app" ClaudeStatusBar-zh-macos.zip
+          echo "大小: $(du -h ClaudeStatusBar-zh-macos.zip | cut -f1)"
 
       - uses: actions/upload-artifact@v5
         with:
-          name: ClaudeFloat-zh
-          path: float/build/ClaudeFloat-zh.zip
+          name: ClaudeStatusBar-zh-macos
+          path: build/ClaudeStatusBar-zh-macos.zip
           retention-days: 30
 
       - name: 发布 Release
@@ -94,14 +89,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            build/ClaudeStatusBar-zh.zip \
-            float/build/ClaudeFloat-zh.zip \
+          gh release create "${GITHUB_REF_NAME}" build/ClaudeStatusBar-zh-macos.zip \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            --notes "**ClaudeStatusBar-zh.zip** — 菜单栏主程序（必装）
-          **ClaudeFloat-zh.zip** — 桌面浮窗（可选，装了才能在「选项 → 桌面浮窗」里打开）
+            --notes "**仅 macOS**（12.0+，Intel 与 Apple Silicon 通用）。桌面浮窗已内置在 app 里，无需单独安装。
 
-          > 两者均为 **ad-hoc 签名**（无 Apple Developer ID），首次打开会被 Gatekeeper 拦截。
+          > 本构建为 **ad-hoc 签名**（无 Apple Developer ID），首次打开会被 Gatekeeper 拦截。
           > 右键点图标 → 打开 → 再点「打开」，或执行：
           > \`xattr -dr com.apple.quarantine \"/Applications/Claude Status Bar.app\"\`"
