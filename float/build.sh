@@ -7,12 +7,25 @@ cd "$(dirname "$0")"
 APP="build/Claude Float.app"
 BIN="$APP/Contents/MacOS/csb-float"
 
-echo "编译 release…"
-cargo build --release -q
+# 两个 target 都编再 lipo 合并。只跑 `cargo build --release` 只会产出本机架构，
+# 在 Apple Silicon 的 CI runner 上出来的包，Intel Mac 根本跑不起来。
+ARM=aarch64-apple-darwin
+X86=x86_64-apple-darwin
+rustup target add $ARM $X86 >/dev/null 2>&1 || true
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-cp target/release/csb-float "$BIN"
+
+echo "编译 $ARM …"
+cargo build --release -q --target $ARM
+if cargo build --release -q --target $X86 2>/dev/null; then
+    lipo -create "target/$ARM/release/csb-float" "target/$X86/release/csb-float" -output "$BIN"
+    echo "已合并为通用二进制"
+else
+    echo "⚠️  $X86 编译失败（缺工具链），仅打包 $ARM"
+    cp "target/$ARM/release/csb-float" "$BIN"
+fi
+echo "架构: $(lipo -archs "$BIN")"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

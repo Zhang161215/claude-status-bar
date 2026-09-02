@@ -72,6 +72,13 @@ jobs:
           # LSUIElement 必须为真，否则会在 Dock 里留一个图标
           test "$(defaults read "$PWD/$APP/Contents/Info.plist" LSUIElement)" = "1" \
             || { echo "::error::LSUIElement 未生效"; exit 1; }
+          # runner 是 Apple Silicon，漏了交叉编译就会悄悄退化成 arm64-only，Intel Mac 跑不起来
+          ARCHS="$(lipo -archs "$APP/Contents/MacOS/csb-float")"
+          echo "浮窗架构: $ARCHS"
+          case "$ARCHS" in
+            *x86_64*arm64*|*arm64*x86_64*) ;;
+            *) echo "::error::浮窗不是通用二进制（$ARCHS）"; exit 1 ;;
+          esac
           cd float/build
           ditto -c -k --sequesterRsrc --keepParent "Claude Float.app" ClaudeFloat-zh.zip
           echo "大小: $(du -h ClaudeFloat-zh.zip | cut -f1)"
